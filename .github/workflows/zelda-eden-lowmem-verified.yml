@@ -1,0 +1,67 @@
+# Compile the Eden-based Zelda host with experimentally adjustable image memory.
+# Test-only APK: on-device pack preparation is simulated; an already prepared
+# compatible Zelda pack is needed. The test app installs separately.
+name: Zelda Eden low-memory verified build
+
+on:
+  push:
+    branches: [opt/eden-low-memory]
+    paths:
+      - dm/gfx/vk_android/vka_imgmem.c
+      - docs/env_switches.tsv
+      - .github/workflows/zelda-eden-lowmem-verified.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zelda-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Eden-based fork branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Ensure Zelda profile and switches are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dm/games/0400486024DEC000/game.tsv
+          grep -q '^DM_VK_IMGMEM_BLOCK_MB' docs/env_switches.tsv
+          grep -q '^DM_VK_IMGMEM_KEEP_EMPTY' docs/env_switches.tsv
+          grep -q 'image memory blocks:' dm/gfx/vk_android/vka_imgmem.c
+          git rev-parse HEAD | tee "$RUNNER_TEMP/source-commit.txt"
+
+      - name: Install Android SDK 36 and NDK 28.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+          echo "sdk.dir=$SDK" > android/app/local.properties
+
+      - name: Build real Zelda Vulkan host with test-only packer
+        working-directory: android/app
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon -PnxGames=0400486024DEC000 -PnxPackEngine=fake -PnxApp=zelda8gb apk
+          test -s out/nxnative-android-zelda8gb.apk
+          sha256sum out/nxnative-android-zelda8gb.apk | tee "$RUNNER_TEMP/zelda-apk-sha256.txt"
+
+      - name: Upload APK and fingerprint
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zelda-eden-lowmem-verified-existing-pack-required
+          path: |
+            android/app/out/nxnative-android-zelda8gb.apk
+            ${{ runner.temp }}/zelda-apk-sha256.txt
+          if-no-files-found: error
+          retention-days: 7
