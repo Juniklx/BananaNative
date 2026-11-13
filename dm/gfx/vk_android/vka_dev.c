@@ -802,6 +802,7 @@ static void *completion_main(void *arg) {
 }
 
 // ---------- Scratch memory ----------
+#include "vka_scratch_policy.h"
 // Blocks of host-visible memory handed out linearly. Two owners: the submission being recorded (class 0: the blocks retire at its fence, vka_scratch_retire) and the
 // open upload batch (class 1, while vka_scr_up is set on the calling thread: the blocks retire at the batch's value on the upload timeline, vka_up_flush). A block goes
 // back to use once that value is reached
@@ -845,15 +846,31 @@ void vka_mem_grew(uint64_t bytes) {
 // Idle blocks (their value reached) larger than the standard 16 MiB, or beyond 64 MiB of idle blocks in all, are freed (under g_smu): at every miss and at every retire.
 // Kept, every block stayed for the process's life: Mario Kart World 1.8.0's boot uploads (levels of up to 144 MiB, each in a block of its size) left 1.4 GB of scratch
 // before its first frame, and the phone's low-memory killer stopped it
+// Lower the idle staging cache only when requested. In-flight and open buffers
+// are never evicted; the two GPU completion timelines decide which are idle.
+static VkDeviceSize scratch_idle_limit(void) {
+    int mb = VKA_ENV("DM_VK_SCRATCH_IDLE_MB", 64);
+    if (mb < 0 || mb > 64) mb = 64;
+    return (VkDeviceSize)mb << 20;
+}
 static void sblk_trim(uint64_t done, uint64_t udone) {
-    VkDeviceSize idle = 0;
+    VkDeviceSize idle = 0, freed = 0, limit = scratch_idle_limit();
+    int freed_n = 0;
     for (sblk **pp = &g_busy; *pp;) {
         sblk *b = *pp;
         int id = sblk_idle(b, done, udone);
-        if (id && (b->size > (16u << 20) || idle + b->size > (64u << 20))) {
+        if (vksc_trim_block(id, b->size, idle, limit)) {
+            VkDeviceSize bytes = b->size;
             *pp = b->next; vk.vkUnmapMemory(V.dev, b->mem); vk.vkDestroyBuffer(V.dev, b->buf, NULL); vk.vkFreeMemory(V.dev, b->mem, NULL);
-            atomic_fetch_sub(&g_scratch_bytes, b->size); atomic_fetch_sub(&g_scratch_n, 1); free(b);
+            atomic_fetch_sub(&g_scratch_bytes, bytes); atomic_fetch_sub(&g_scratch_n, 1); free(b);
+            freed += bytes; freed_n++;
         } else { if (id) idle += b->size; pp = &b->next; }
+    }
+    if (freed && limit != VKSC_DEFAULT_IDLE) {
+        static _Atomic int n;
+        if (atomic_fetch_add(&n, 1) < 32)
+            VLOG("scratch idle trim: freed %.1f MiB (%d GPU-completed blocks), kept %.1f MiB idle (limit %.0f MiB); all scratch still allocated %.1f MiB (DM_VK_SCRATCH_IDLE_MB)",
+                 freed / 1048576.0, freed_n, idle / 1048576.0, limit / 1048576.0, atomic_load(&g_scratch_bytes) / 1048576.0);
     }
 }
 int vka_scratch(VkDeviceSize n, VkDeviceSize align, vka_span *out) {
@@ -880,7 +897,10 @@ int vka_scratch(VkDeviceSize n, VkDeviceSize align, vka_span *out) {
 static void retire(int c, uint64_t value) {
     pthread_mutex_lock(&g_smu);
     while (g_open[c]) { sblk *b = g_open[c]; g_open[c] = b->next; b->fence = value; b->next = g_busy; g_busy = b; }
-    if (c) { g_ubytes = 0; sblk_trim(vka_done(), up_done()); }   // (the submission's blocks are trimmed at a miss only: a game that takes more than 16 MiB a frame would make and free them every frame)
+    if (c) g_ubytes = 0;
+    // Normal mode retains the original policy: trim on upload retire and scratch miss.
+    // Low-memory mode also checks each submission retire, after its older fences.
+    if (c || scratch_idle_limit() < VKSC_DEFAULT_IDLE) sblk_trim(vka_done(), up_done());
     pthread_mutex_unlock(&g_smu);
 }
 void vka_scratch_retire(uint64_t fence) { retire(0, fence); }
