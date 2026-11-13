@@ -1,0 +1,66 @@
+# Experimental Android memory-reclaim A/B test.
+# Compiles Zelda's real Vulkan host and a FAKE on-device packer. A preprepared,
+# compatible game pack is required; the APK contains no commercial game content.
+name: Zelda file-backed PAGEOUT experiment
+
+on:
+  push:
+    branches: [opt/eden-fileback-pageout]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests-and-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout isolated experimental branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Linux file-backed memory regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined \
+            -o "$RUNNER_TEMP/t_android_fileback" dm/host/tests/t_android_fileback.c -lpthread
+          TMPDIR="$RUNNER_TEMP" "$RUNNER_TEMP/t_android_fileback"
+          test -s dm/games/0400486024DEC000/game.tsv
+          grep -q '^DM_MEM_FILEBACK_PAGEOUT[[:space:]]' docs/env_switches.tsv
+          git rev-parse HEAD | tee "$RUNNER_TEMP/source-commit.txt"
+
+      - name: Install Android SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+          echo "sdk.dir=$SDK" > android/app/local.properties
+
+      - name: Compile experimental Zelda host and APK
+        working-directory: android/app
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon -PnxGames=0400486024DEC000 \
+            -PnxPackEngine=fake -PnxApp=zeldapageout apk
+          test -s out/nxnative-android-zeldapageout.apk
+          sha256sum out/nxnative-android-zeldapageout.apk | tee "$RUNNER_TEMP/apk-sha256.txt"
+
+      - name: Upload APK and reproducibility fingerprints
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zelda-pageout-experimental-APK-prepared-pack-required
+          path: |
+            android/app/out/nxnative-android-zeldapageout.apk
+            ${{ runner.temp }}/source-commit.txt
+            ${{ runner.temp }}/apk-sha256.txt
+          if-no-files-found: error
+          retention-days: 7
