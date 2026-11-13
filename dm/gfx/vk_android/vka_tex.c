@@ -1334,6 +1334,22 @@ static void big_note(vka_img *im, const tex_t *t) {   // a new image of texture 
     for (int i = 0; i < g_nbig; i++) { vka_img *b = g_big[i];
         if (b == im || !ranges_meet(b->mem, b->L.size, t->mem, t->L.size)) continue;
         ovl_add(b, t->serial);
+        // Diagnostic only: separate images on the same guest address do not necessarily
+        // have compatible Vulkan formats or identical descriptors. This records the
+        // eligibility tests before anyone considers sharing VkDeviceMemory (unsafe
+        // without format/view compatibility and coordinated image lifetimes).
+        if (b->mem == t->mem && b->w == im->w && b->h == im->h && b->f.vk != im->f.vk) {
+            int desc = b->d.target == t->d.target && b->d.width == t->d.width && b->d.height == t->d.height &&
+                       b->d.depth == t->d.depth && b->d.levels == t->d.levels && b->d.samples == t->d.samples;
+            int fmt = b->f.kind <= 2 && im->f.kind <= 2 && b->f.bpb == im->f.bpb &&
+                      !compressed(&b->f) && !compressed(&im->f);
+            int listed = fmt && img_lists(b, im->f.vk) && img_lists(b, im->f.view);
+            static _Atomic int nfmt;
+            if (atomic_fetch_add(&nfmt, 1) < 16)
+                VLOG("large image overlap check: old serial %llu NVN %#x VkFormat %d (%u bytes/block), new serial %llu NVN %#x VkFormat %d (%u bytes/block); same descriptor %d, uncompressed compatible-size format candidate %d, old image format list covers new views %d; separate Vulkan images retained",
+                     (unsigned long long)b->serial, b->d.format, b->f.vk, b->f.bpb,
+                     (unsigned long long)im->serial, im->d.format, im->f.vk, im->f.bpb, desc, fmt, listed);
+        }
         if (atomic_fetch_add(&nl, 1) < 32) VLOG("large image serial %llu (%ux%u format %#x, storage %p+%#llx): texture serial %llu %ux%ux%u layers %u format %#x flags %#x target %d over its storage (%p+%#llx), an image of its own%s",
             (unsigned long long)b->serial, b->w, b->h, b->d.format, (const void *)b->mem, (unsigned long long)b->L.size, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->L.layers,
             t->d.format, t->d.flags, t->d.target, (const void *)t->mem, (unsigned long long)t->L.size, im->m.z ? " (zero-shared)" : ""); }
