@@ -1,4 +1,4 @@
-// Image memory: small images share 64 MiB blocks instead of a VkDeviceMemory each (android/PORTING.md, NVN → Vulkan replay, Textures).
+// Image memory: small images share configurable blocks (64 MiB by default) instead of a VkDeviceMemory each (android/PORTING.md, NVN → Vulkan replay, Textures).
 // Every image had a dedicated allocation of its own. Beside the placed pool segments (vka_mem.c) that runs into the device's maxMemoryAllocationCount: Mario Kart World's
 // image allocations all failed from about 2,300 images on (beside 1,732 segments, "-2; 262 MiB in images", small images too), and Donkey Kong Bananza keeps about 7,200.
 // The count problem is thousands of small images, so only an image under VKA_IMEM_MAX (4 MiB) whose memory requirements neither require nor prefer a dedicated allocation
@@ -8,7 +8,7 @@
 // Memory overhead: block space no image uses is committed memory too (the "free in blocks" of the stats line), which matters to a game near the low-memory killer (Donkey Kong
 // Bananza: 8.07 GB RSS, killed at about 9.2 GB); an earlier version rounded every image up to a power of two (a third more for mipped textures, up to half for 8-16 MiB ones).
 // Lifetime: as before, an image's memory is given back in img_destroy, which runs once the GPU is done with the image (vka_after), after vkDestroyImage. A block with no image
-// left is freed, except one empty block a memory type keeps for the next images. The 64 MiB vkAllocateMemory runs outside the lock (other threads' allocations and frees go on).
+// left is freed, except one empty block a memory type keeps for the next images by default. The vkAllocateMemory runs outside the lock (other threads' allocations and frees go on).
 // Large never-written GPU-content images instead alias one zeroed allocation per create info (vka_imem_bind_zero; vka_tex.c "Zero-shared images")
 #if defined(__ANDROID__)
 #include "vka.h"
@@ -17,17 +17,24 @@
 #include <stdlib.h>
 
 #define UNIT 256ull
-#define BLOCK (64ull << 20)
+#define BLOCK_DEFAULT (64ull << 20)
 #define VKA_IMEM_MAX (4ull << 20)            // images of at least 4 MiB keep their own allocation
-typedef struct iblock { struct iblock *next; VkDeviceMemory dm; uint32_t type; vke_list free; } iblock;
+// Opt-in low-memory tuning. Smaller blocks commit less unused memory, at the cost of more Vulkan allocations.
+// Only 16, 32 and 64 MiB are supported; an invalid value preserves the original 64 MiB behavior.
+static uint64_t block_size(void) {
+    int mb = VKA_ENV("DM_VK_IMGMEM_BLOCK_MB", 64);
+    if (mb != 16 && mb != 32 && mb != 64) mb = 64;
+    return (uint64_t)mb << 20;
+}
+typedef struct iblock { struct iblock *next; VkDeviceMemory dm; uint32_t type; uint64_t size; vke_list free; } iblock;
 static iblock *g_blocks[VK_MAX_MEMORY_TYPES];
 static pthread_mutex_t g_imu = PTHREAD_MUTEX_INITIALIZER;
 // Stats (under g_imu): blocks, images in blocks (count, units' bytes, the images' own sizes), dedicated allocations (count, bytes), blocks freed, block allocations that failed
-static struct { uint64_t blocks, runs, run_bytes, req_bytes, ded, ded_bytes, freed, fail; } S;
+static struct { uint64_t blocks, block_bytes, runs, run_bytes, req_bytes, ded, ded_bytes, freed, fail; } S;
 
 // Shared memory for the image (it fits a block): 1, or 0 (a dedicated allocation)
 static int sharable(VkImage img, uint32_t type, const VkMemoryRequirements *mr) {
-    if (!VKA_ENV("DM_VK_IMGMEM", 1) || mr->size >= VKA_IMEM_MAX || mr->alignment > VKA_IMEM_MAX || type >= VK_MAX_MEMORY_TYPES || BLOCK > V.max_alloc
+    if (!VKA_ENV("DM_VK_IMGMEM", 1) || mr->size >= VKA_IMEM_MAX || mr->alignment > VKA_IMEM_MAX || type >= VK_MAX_MEMORY_TYPES || block_size() > V.max_alloc
         || !vk.vkGetImageMemoryRequirements2) return 0;
     VkMemoryDedicatedRequirements dr = {VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS};
     VkMemoryRequirements2 r2 = {VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2, &dr};
@@ -65,13 +72,14 @@ VkResult vka_imem_bind(VkImage img, uint32_t type, const VkMemoryRequirements *m
     for (iblock *b = g_blocks[type]; b && !got; b = b->next) got = take(b, n, al, mr, m);
     pthread_mutex_unlock(&g_imu);
     if (!got) {   // a new block, allocated without the lock; another thread may have added one meanwhile, which is tried first
+        uint64_t bytes = block_size();
         iblock *nb = calloc(1, sizeof *nb);
-        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = BLOCK, .memoryTypeIndex = type};
-        int ok = nb && vke_init(&nb->free, (uint32_t)(BLOCK / UNIT)) && !vk.vkAllocateMemory(V.dev, &ai, NULL, &nb->dm);
+        VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = bytes, .memoryTypeIndex = type};
+        int ok = nb && vke_init(&nb->free, (uint32_t)(bytes / UNIT)) && !vk.vkAllocateMemory(V.dev, &ai, NULL, &nb->dm);
         if (nb && !ok) nb->dm = VK_NULL_HANDLE;
         pthread_mutex_lock(&g_imu);
         for (iblock *b = g_blocks[type]; b && !got; b = b->next) got = take(b, n, al, mr, m);
-        if (!got && ok) { nb->type = type; nb->next = g_blocks[type]; g_blocks[type] = nb; S.blocks++; got = take(nb, n, al, mr, m); nb = NULL; }
+        if (!got && ok) { nb->type = type; nb->size = bytes; nb->next = g_blocks[type]; g_blocks[type] = nb; S.blocks++; S.block_bytes += bytes; got = take(nb, n, al, mr, m); nb = NULL; }
         if (!ok) S.fail++;
         pthread_mutex_unlock(&g_imu);
         if (nb) { if (nb->dm) vk.vkFreeMemory(V.dev, nb->dm, NULL); vke_fini(&nb->free); free(nb); }   // not needed (another thread's block had room) or not allocated
@@ -139,11 +147,11 @@ void vka_imem_free(vka_imem *m) {
     if (fr == -2) VRED_ONCE("image memory block: units %llu+%u given back twice or never given (left as they are)", (unsigned long long)(m->off / UNIT), m->units);
     else if (fr) { VRED_ONCE("image memory block: free extent list not grown, %u units lost to reuse until the block empties", m->units); b->free.used -= m->units; }   // still counted free: the block can be released
     if (fr != -2) { S.runs--; S.run_bytes -= m->units * UNIT; S.req_bytes -= m->size; }   // a bad free was never a run
-    if (vke_empty(&b->free)) {   // freed unless it is the memory type's only empty block
+    if (vke_empty(&b->free)) {   // low-memory mode may free even the last empty block of this memory type
         int empties = 0; for (iblock *x = g_blocks[b->type]; x; x = x->next) empties += vke_empty(&x->free);
-        if (empties > 1) {
+        if (!VKA_ENV("DM_VK_IMGMEM_KEEP_EMPTY", 1) || empties > 1) {
             for (iblock **p = &g_blocks[b->type]; *p; p = &(*p)->next) if (*p == b) { *p = b->next; break; }
-            gone = b; S.blocks--; S.freed++;
+            gone = b; S.blocks--; S.block_bytes -= b->size; S.freed++;
         }
     }
     pthread_mutex_unlock(&g_imu);
@@ -155,8 +163,8 @@ void vka_imem_free(vka_imem *m) {
 void vka_imem_stats(char *o, size_t n) {
     pthread_mutex_lock(&g_imu);
     snprintf(o, n, "image memory: %llu blocks (%.0f MiB, %llu freed), used %.1f MiB by %llu images (wasted %.2f MiB rounding to units, %.1f MiB free in blocks), %llu dedicated (%.0f MiB)",
-             (unsigned long long)S.blocks, S.blocks * (double)BLOCK / 1048576.0, (unsigned long long)S.freed, S.req_bytes / 1048576.0, (unsigned long long)S.runs,
-             (S.run_bytes - S.req_bytes) / 1048576.0, (S.blocks * (double)BLOCK - S.run_bytes) / 1048576.0, (unsigned long long)S.ded, S.ded_bytes / 1048576.0);
+             (unsigned long long)S.blocks, S.block_bytes / 1048576.0, (unsigned long long)S.freed, S.req_bytes / 1048576.0, (unsigned long long)S.runs,
+             (S.run_bytes - S.req_bytes) / 1048576.0, (S.block_bytes - S.run_bytes) / 1048576.0, (unsigned long long)S.ded, S.ded_bytes / 1048576.0);
     if (S.fail) { size_t l = strlen(o); snprintf(o + l, n - l, "; %llu block allocations failed (those images dedicated)", (unsigned long long)S.fail); }
     if (Z.made) { uint64_t zi, za, zb, zs; vkz_stats(&Z, &zi, &za, &zb, &zs); size_t l = strlen(o);
         snprintf(o + l, n - l, "; zero-shared: %llu images in %llu allocations (%.0f MiB, %.0f MiB saved), %llu made their own", (unsigned long long)zi, (unsigned long long)za, zb / 1048576.0, zs / 1048576.0, (unsigned long long)Z.owned); }
