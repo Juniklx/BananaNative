@@ -121,7 +121,7 @@ jobs:
           grep -F "package: name='dev.nxnative.android.zeldareclaim2' versionCode='$VERSION_CODE'" "$RUNNER_TEMP/package-info.txt"
           echo "APK package: dev.nxnative.android.zeldareclaim2, versionCode: $VERSION_CODE" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Compare certificate with previous installed test channel
+      - name: Verify signature matches first stable update-channel APK
         shell: bash
         continue-on-error: true
         env:
@@ -129,8 +129,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/previous"
-          gh run download 43352307447 -R "$GITHUB_REPOSITORY" \
-            -n zelda-reclaim-v2-APK-prepared-pack-required \
+          gh run download 43354256396 -R "$GITHUB_REPOSITORY" \
+            -n zelda-updatable-APK-existing-pack-required \
             -D "$RUNNER_TEMP/previous"
           OLD="$(find "$RUNNER_TEMP/previous" -type f -name 'nxnative-android-zeldareclaim2.apk' -print -quit)"
           test -n "$OLD"
@@ -138,10 +138,10 @@ jobs:
           OLD_CERT="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/previous-signer.txt" | head -1)"
           NEW_CERT="$(cat "$RUNNER_TEMP/signer-sha256.txt")"
           if [ "$OLD_CERT" = "$NEW_CERT" ]; then
-            echo "Previous zeldareclaim2 signer matches: you can install this APK over the old one." >> "$GITHUB_STEP_SUMMARY"
+            echo "Stable update channel signer matches: future APKs update this package without erasing settings." >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Previous zeldareclaim2 signer differs: ONE clean reinstall is required for this stable update channel." >> "$GITHUB_STEP_SUMMARY"
-            echo "::warning::Signer differs from run 43352307447: one-time reinstall required."
+            echo "Stable update channel signer differs: do not install this APK, the signer unexpectedly changed." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Signer differs from the pinned stable update channel run 43354256396."
           fi
 
       - name: Upload updatable APK and public fingerprints
