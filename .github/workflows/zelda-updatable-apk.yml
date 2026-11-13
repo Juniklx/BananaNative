@@ -108,10 +108,16 @@ jobs:
           test -s "$APK"
           sha256sum "$APK" | tee "$RUNNER_TEMP/apk-sha256.txt"
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK" > "$RUNNER_TEMP/apk-signer.txt"
-          CERT="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apk-signer.txt" | head -1)"
-          test -n "$CERT"
-          test "$CERT" = "$(cat "$RUNNER_TEMP/signer-sha256.txt")"
-          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | grep -F "package: name='dev.nxnative.android.zeldareclaim2' versionCode='$VERSION_CODE'" 
+          cat "$RUNNER_TEMP/apk-signer.txt"
+          CERT="$(sed -n 's/.*[Ss]igner #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apk-signer.txt" | head -1 | tr 'A-F' 'a-f' | tr -d '\r')"
+          EXPECTED="$(cat "$RUNNER_TEMP/signer-sha256.txt")"
+          echo "APK signer cert: ${CERT:-missing}; cached cert: $EXPECTED"
+          if [ -z "$CERT" ] || [ "$CERT" != "$EXPECTED" ]; then
+            echo "::error::The signed APK does not match the cached signing certificate."
+            exit 1
+          fi
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | grep "^package: " | tee "$RUNNER_TEMP/package-info.txt"
+          grep -F "package: name='dev.nxnative.android.zeldareclaim2' versionCode='$VERSION_CODE'" "$RUNNER_TEMP/package-info.txt"
           echo "APK package: dev.nxnative.android.zeldareclaim2, versionCode: $VERSION_CODE" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Compare certificate with previous installed test channel
