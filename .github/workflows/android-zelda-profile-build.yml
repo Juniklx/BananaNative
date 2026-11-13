@@ -1,0 +1,71 @@
+# Build a Zelda-profile APK for testing the memory changes on Android.
+# Source game profile is pinned to a public community snapshot; no game binaries are included.
+# This build uses the FAKE *packer only*: an already prepared compatible pack is required to play.
+name: Android Zelda profile build
+
+on:
+  push:
+    branches:
+      - opt/android-low-memory-image-blocks
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  zelda-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Import Zelda profile from pinned source
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROFILE_COMMIT=c67cf2e063f3ca3c709ec5d0185f99e46d5b91aa
+          SOURCE="$RUNNER_TEMP/banana-profile"
+          mkdir -p "$SOURCE"
+          git -C "$SOURCE" init -q
+          git -C "$SOURCE" remote add origin https://github.com/xmllua/BananaNative-Pro.git
+          git -C "$SOURCE" config core.sparseCheckout true
+          mkdir -p "$SOURCE/.git/info"
+          printf 'dm/games/0400486024DEC000/\n' > "$SOURCE/.git/info/sparse-checkout"
+          git -C "$SOURCE" fetch --depth=1 --filter=blob:none origin "$PROFILE_COMMIT"
+          git -C "$SOURCE" checkout --detach --quiet FETCH_HEAD
+          test "$(git -C "$SOURCE" rev-parse HEAD)" = "$PROFILE_COMMIT"
+          test -s "$SOURCE/dm/games/0400486024DEC000/game.tsv"
+          cp -a "$SOURCE/dm/games/0400486024DEC000" dm/games/
+          echo "Zelda profile imported from pinned commit: $PROFILE_COMMIT"
+          echo "NOTE: code and shader tables are profile metadata, not game or console files."
+
+      - name: Install Android SDK packages and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER" || { echo "::error::sdkmanager not found at $SDKMANAGER"; exit 1; }
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+          echo "sdk.dir=$SDK" > android/app/local.properties
+
+      - name: Compile Zelda native host and test APK
+        shell: bash
+        working-directory: android/app
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon -PnxGames=0400486024DEC000 -PnxPackEngine=fake -PnxApp=zelda8gb apk
+          test -s out/nxnative-android-zelda8gb.apk
+
+      - name: Upload Zelda profile APK (requires existing prepared pack)
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: banana-zelda-lowmem-APK-REQUIRES-PREPARED-PACK
+          path: android/app/out/nxnative-android-zelda8gb.apk
+          if-no-files-found: error
+          retention-days: 7

@@ -1,0 +1,106 @@
+# Imports the CURRENT official Eden Android branch into a separate GitHub branch,
+# applies the reviewable low-memory image-allocation patch, and builds a Zelda APK.
+# Never rewrites the fork's android default branch. The APK's on-device packer is
+# simulated: existing compatible Zelda packs can be used, but Prepare is not functional.
+name: Official Eden Zelda low-memory build
+
+on:
+  push:
+    branches:
+      - opt/android-low-memory-image-blocks
+    paths:
+      - .github/workflows/eden-official-zelda-build.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  rebase-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - name: Checkout the low-memory patch on GitHub
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Extract ONLY the Vulkan image-memory code patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff origin/android...HEAD -- dm/gfx/vk_android/vka_imgmem.c > "$RUNNER_TEMP/lowmem.patch"
+          test -s "$RUNNER_TEMP/lowmem.patch"
+          echo "Patch extracted from the fork's isolated optimization branch"
+
+      - name: Clone latest official Eden sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --single-branch --branch android \
+            https://git.eden-emu.dev/moceure/BananaNative.git "$RUNNER_TEMP/eden"
+          git -C "$RUNNER_TEMP/eden" rev-parse HEAD | tee "$RUNNER_TEMP/eden-sha.txt"
+          test -s "$RUNNER_TEMP/eden/dm/games/0400486024DEC000/game.tsv"
+
+      - name: Apply the patch with strict conflict check
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/eden"
+          git switch -c opt/eden-low-memory
+          git apply --check "$RUNNER_TEMP/lowmem.patch"
+          git apply "$RUNNER_TEMP/lowmem.patch"
+          git add dm/gfx/vk_android/vka_imgmem.c
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              commit -m "vk: experimental low-memory image block allocation"
+          git diff --check HEAD~1 HEAD
+          echo "Official Eden commit: $(cat "$RUNNER_TEMP/eden-sha.txt")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push rebased code into a new branch without modifying android
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/eden"
+          git -c http.extraheader="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" \
+            push https://github.com/${{ github.repository }}.git HEAD:refs/heads/opt/eden-low-memory
+          echo "Isolated branch: opt/eden-low-memory" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Android SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+          echo "sdk.dir=$SDK" > "$RUNNER_TEMP/eden/android/app/local.properties"
+
+      - name: Build a test-only Zelda profile APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/eden/android/app"
+          chmod +x ./gradlew
+          ./gradlew --no-daemon \
+            -PnxGames=0400486024DEC000 \
+            -PnxPackEngine=fake \
+            -PnxApp=zelda8gb apk
+          test -s out/nxnative-android-zelda8gb.apk
+          sha256sum out/nxnative-android-zelda8gb.apk | tee "$RUNNER_TEMP/zelda-apk-sha256.txt"
+
+      - name: Upload test-only APK
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: eden-zelda-lowmem-EXISTING-PACK-REQUIRED
+          path: |
+            ${{ runner.temp }}/eden/android/app/out/nxnative-android-zelda8gb.apk
+            ${{ runner.temp }}/zelda-apk-sha256.txt
+          if-no-files-found: error
+          retention-days: 7

@@ -436,6 +436,14 @@ The guest address space, heaps, pools, virtual address memory and the allocators
 - **Check:** `make -C dm/gfx/tex/tests run` (N: each band deswizzled from its own bytes only equals the whole level). On the phone, the `DM_VK_MEMLOG` lines: Mario Kart World 1.8.0's scratch peaked at 256 MiB and was 96-144 MiB when its run ended (1,488 MiB before). Donkey Kong Bananza ran unchanged: 30 fps, the same `[RED]` lines, the same PSS.
 - **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md) 1.8.0 at boot: 1,488 MiB of scratch in flight, next to 4,494 MiB of placed pools and 3,204 MiB of images (sparse images counted at their full size). The 16 GB phone stopped it 14 s in.
 
+### Unused Vulkan image-block capacity under Android memory pressure (experimental)
+
+- **Symptom:** image-memory statistics report substantial `free in blocks` while the Android low-memory killer is active. The Vulkan replay's small-image allocator commits a full 64 MiB block for each new memory type and keeps one empty block per type for reuse.
+- **Cause:** block capacity is committed even when the images inside use only part of it. Keeping an empty block avoids later allocation overhead, but retains committed memory during scene transitions.
+- **Experiment:** `dm/gfx/vk_android/vka_imgmem.c` accepts `DM_VK_IMGMEM_BLOCK_MB=16` (or 32; default 64) and `DM_VK_IMGMEM_KEEP_EMPTY=0` (default 1). Smaller blocks reduce the maximum stranded capacity per block, and zero empty-block retention releases a block when its last image has been destroyed and retired from GPU use. Both switches affect *small pooled images only* (under 4 MiB); dedicated images, placed guest pools, zero-shared images, and large render targets are unchanged. The statistics count actual block bytes even if the size changes between allocations.
+- **Check:** compare identical workloads with the defaults and the opt-in settings, recording `image memory: ... free in blocks`, allocation counts, `MemAvailable`, any `lmkd` termination, and driver errors. More small allocations can reduce performance or reach `maxMemoryAllocationCount`; use `DM_VK_IMGMEM_BLOCK_MB=64 DM_VK_IMGMEM_KEEP_EMPTY=1` to restore the original behavior. The configuration is not yet verified to make an 8 GB device complete a large 3D scene.
+- **Status:** opt-in mitigation for an Android memory constraint, not a demonstrated root-cause fix for a specific game.
+
 ### Cleared images the GPU never writes hold memory of their own (Android)
 
 - **Symptom:** on the phone, the ctl stats show most image memory in images nothing has written: `ctl: images not GPU-written: cleared 1655 MB (325 …)` beside `GPU-written 794 MB`, and `large image: … 16384x16384 … format 0x1 … flags 0x28: 341.2 MiB` four times (`DM_VK_BIGIMG_MB`).
