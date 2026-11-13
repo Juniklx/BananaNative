@@ -22,6 +22,10 @@ typedef struct {
 } vktl_in;
 
 static inline uint64_t vktl_sub(uint64_t a, uint64_t b) { return a > b ? a - b : 0; }
+// Forecast the next allocation without wrapping around the address-space limit.
+static inline uint64_t vktl_projected(uint64_t current, uint64_t incoming) {
+    return incoming > UINT64_MAX - current ? UINT64_MAX : current + incoming;
+}
 // What RAM keeps free for the game's own growth, the rest of the process and the system: a 32nd, at least 512 MiB. Small on purpose: Android keeps MemAvailable low while
 // it has cached apps and compressed swap to give (Mario Kart World runs at 0.7-1 GB of it on a 16 GB phone), so a larger reserve would put a game that fits over the limit
 // On a device of 12 GB or less (MemTotal up to 12 GiB) an eighth: there the game itself needs nearly all the RAM the system leaves (Ocarina of Time on an

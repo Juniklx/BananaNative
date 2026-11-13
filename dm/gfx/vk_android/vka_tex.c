@@ -1670,12 +1670,12 @@ static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
 }
 typedef struct { vka_img *im; uint64_t last; int gpu; } prune_ent;
 static int prune_cmp(const void *a, const void *b) { const prune_ent *x = a, *y = b; return vktl_order(x->gpu, x->last, y->gpu, y->last); }
-static void vka_tex_prune_locked(void) {
+static void vka_tex_prune_locked(uint64_t incoming) {
     uint64_t cur_frame = vka_frame();
     if (!cur_frame) return;
     img_limit_update(cur_frame);
     uint64_t limit_bytes = g_img_lim, total_bytes = g_img_bytes + vka_imem_zbytes();
-    if (!limit_bytes || total_bytes <= limit_bytes || g_prune_dry == cur_frame) return;   // (dry: this frame had nothing to evict; a miss after it finds nothing new)
+    if (!limit_bytes || vktl_projected(total_bytes, incoming) <= limit_bytes || (!incoming && g_prune_dry == cur_frame)) return;   // A new large allocation gets a fresh check even if the ordinary prune found nothing this frame
     static prune_ent *c; static int ccap; int nc = 0;
     if (ccap < g_nlive) { ccap = g_nlive + 256; c = realloc(c, (size_t)ccap * sizeof *c); }
     uint64_t done_fence = vka_done(); int video = dm_movie_playing();
@@ -1699,7 +1699,7 @@ static void vka_tex_prune_locked(void) {
     }
     qsort(c, (size_t)nc, sizeof *c, prune_cmp);
     uint64_t target = vktl_target(limit_bytes), bytes_freed = 0; int pruned = 0;
-    for (int k = 0; k < nc && total_bytes > target; k++) {
+    for (int k = 0; k < nc && vktl_projected(total_bytes, incoming) > target; k++) {
         uint64_t before = g_img_bytes + vka_imem_zbytes();
         img_evict_locked(c[k].im);
         uint64_t after = g_img_bytes + vka_imem_zbytes(), b = before > after ? before - after : 0;
@@ -1711,13 +1711,18 @@ static void vka_tex_prune_locked(void) {
             VLOG("image cache pruned: evicted %d images unused for %llu+ frames (%.1f MiB freed, %d live remaining, %.1f MiB, limit %.0f MiB)",
                  pruned, (unsigned long long)(cur_frame - c[pruned - 1].last), bytes_freed / 1048576.0, g_nlive, total_bytes / 1048576.0, limit_bytes / 1048576.0);
     }
-    if (total_bytes > limit_bytes) {   // what is left is in use: kept over the limit (logged when the excess first appears and each time it grows by 256 MiB)
+    if (vktl_projected(total_bytes, incoming) > limit_bytes) {   // The protected working set remains over the projected budget
         g_prune_dry = cur_frame;
         static uint64_t logged; static _Atomic int n;
-        if (total_bytes >= logged + 256 * VKTL_MIB && atomic_fetch_add(&n, 1) < 8) {
-            logged = total_bytes;
-            VLOG("image cache over its limit: %.0f MiB of images, limit %.0f MiB; the rest was used in the last %d frames, is held or is named by a texture pool slot (%d images), so it stays (evicting it would upload it again)",
-                 total_bytes / 1048576.0, limit_bytes / 1048576.0, VKTL_KEEP_FRAMES, npool);
+        uint64_t projected = vktl_projected(total_bytes, incoming);
+        if (projected >= logged && projected - logged >= 256 * VKTL_MIB && atomic_fetch_add(&n, 1) < 8) {
+            logged = projected;
+            if (incoming)
+                VLOG("image cache pre-allocation: %.0f MiB currently, next texture storage %.0f MiB (Vulkan size may differ), projected %.0f MiB, limit %.0f MiB; protected images stay",
+                     total_bytes / 1048576.0, incoming / 1048576.0, projected / 1048576.0, limit_bytes / 1048576.0);
+            else
+                VLOG("image cache over its limit: %.0f MiB of images, limit %.0f MiB; the rest was used in the last %d frames, is held or is named by a texture pool slot (%d images), so it stays (evicting it would upload it again)",
+                     total_bytes / 1048576.0, limit_bytes / 1048576.0, VKTL_KEEP_FRAMES, npool);
         }
     }
 }
@@ -1778,10 +1783,16 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
         uint64_t t_new = 0;
         if (!im) {
             t_new = now_ns();
-            vka_tex_prune_locked();
+            vka_tex_prune_locked(0);
             mode = first_mode(t, &f, cpuw_take(t->serial, 0));
             soft = !base && soft_want(t, &f, mode);
             g_zwant = mode == ST_ZERO && !(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE);   // (size: vkz_candidate)
+            // Opt-in: evict eligible stale images before a large new dense allocation.
+            // NVN storage is only an estimate of the driver's image-memory requirement;
+            // GPU-in-flight, recently used and externally held images remain protected.
+            if (VKA_ENV("DM_VK_IMG_PREPRUNE", 0) && !base && !soft && !g_zwant &&
+                !(t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) && t->L.size >= 64 * VKTL_MIB)
+                vka_tex_prune_locked(t->L.size);
             im = img_create(t, &f, soft ? soft_levels(d_levels_of(t)) : base);
             g_zwant = 0;
             if (im && soft) soft_note(im, t);   // (a soft texture: from level 1, "Soft textures" above)
@@ -2913,7 +2924,7 @@ void vka_tex_prepare(VkCommandBuffer cb) {
     nvn_pool_use(1);   // the re-uploads below read guest storage: no pool is finalized (and unmapped) under them. Taken before g_tmu, as write_tex does
     pthread_mutex_lock(&g_tmu);
     pfb_consume_locked();   // the texture IDs read through the pool in submissions done: their images stamped used, null slots written again with their images ("Texture pool reads")
-    vka_tex_prune_locked();   // (the limit measured again every 60 frames; nothing to do under it)
+    vka_tex_prune_locked(0);   // (the limit measured again every 60 frames; nothing to do under it)
     int n_up = 0;
     for (int i = 0; i < g_nredo; i++) {   // CPU writes to textures that already have an image (WriteTexels): from now on they follow their storage
         smap_ent *e = map_get(g_redo[i]); vka_img *im = e ? e->im : NULL;

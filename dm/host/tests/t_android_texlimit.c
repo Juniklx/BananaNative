@@ -81,6 +81,11 @@ int main(void) {
     CHECK(!vktl_evictable(100, 50, 0, 1, 0, 0) && vktl_evictable(200, 50, 0, 1, 0, 0), "GPU content: only after VKTL_GPU_FRAMES");
     CHECK(vktl_order(0, 90, 1, 10) < 0 && vktl_order(0, 10, 0, 90) < 0 && vktl_order(1, 10, 1, 90) < 0, "uploadable before GPU-only, oldest first");
 
+    // Forecast a large Zelda depth image before allocation, without integer overflow.
+    CHECK(vktl_projected(409 * MIB, 288 * MIB) == 697 * MIB, "large image forecast before allocating");
+    CHECK(vktl_projected(96 * MIB, 64 * MIB) < VKTL_FLOOR, "small starting cache needs no pre-prune");
+    CHECK(vktl_projected(UINT64_MAX - 10, 32) == UINT64_MAX, "forecast saturates instead of wrapping");
+
     // A working set (1,800 MiB, 900 images of 2 MiB) over a 1,536 MiB limit: uploaded once, then kept over the limit, not again every frame
     int last = -1, up = run(1200, 900, 2 * MIB, 1536 * MIB, 120, &last);
     CHECK(up == 900 && last == 0, "a working set over the limit: %d uploads, %d in the last frame", up, last);

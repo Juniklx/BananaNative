@@ -39,7 +39,11 @@ jobs:
           cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
             -o "$RUNNER_TEMP/t_vka_scratch_policy" dm/host/tests/t_vka_scratch_policy.c
           "$RUNNER_TEMP/t_vka_scratch_policy"
+          cc -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined \
+            -o "$RUNNER_TEMP/t_android_texlimit" dm/host/tests/t_android_texlimit.c
+          "$RUNNER_TEMP/t_android_texlimit"
           grep -q '^DM_VK_SCRATCH_IDLE_MB[[:space:]]' docs/env_switches.tsv
+          grep -q '^DM_VK_IMG_PREPRUNE[[:space:]]' docs/env_switches.tsv
 
       - name: Restore stable test signer from GitHub Actions cache
         id: signer
