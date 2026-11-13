@@ -49,6 +49,14 @@ int main(void) {
     CHECK(!vkp_by_parts(0xdac00000ull, 0, G), "part minimum 0: whole");
     CHECK(!vkp_by_parts(96 * MIB, 64 * MIB, G), "less than two granules: whole");
     CHECK(vkp_by_parts(128 * MIB, 64 * MIB, G), "two granules: by parts");
+    // The low-memory Zelda experiment uses 16 MiB parts and can opt into
+    // 128 or 256 MiB whole-pool thresholds. Leave any smaller pool whole.
+    const uint64_t ZG = 16 * MIB;
+    CHECK(!vkp_by_parts(64 * MIB, 128 * MIB, ZG), "64 MiB stays whole at 128 MiB threshold");
+    CHECK(vkp_by_parts(232 * MIB, 128 * MIB, ZG), "232 MiB can be placed in 16 MiB parts");
+    CHECK(!vkp_by_parts(232 * MIB, 256 * MIB, ZG), "232 MiB stays whole at 256 MiB threshold");
+    CHECK(vkp_by_parts(288 * MIB, 256 * MIB, ZG), "288 MiB can be placed in 16 MiB parts");
+    CHECK(vkp_by_parts(512 * MIB, 128 * MIB, ZG), "512 MiB can be placed in 16 MiB parts");
 
     // the part: Pokopia's first ask, a buffer 0x25c0000 into the pool (the granule it lies in)
     uint64_t mem = 0x41479fb000ull, size = 0xdac00000ull, lo = 0, hi = 0;
