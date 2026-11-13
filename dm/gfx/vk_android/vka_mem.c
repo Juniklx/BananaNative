@@ -799,11 +799,37 @@ static int place_pool(uintptr_t mem, uint64_t size, seglist *l, int *lg, uint64_
     if (mine_out) *mine_out = mine;
     return placed;
 }
+// Report the candidate whole-pool allocations for the existing
+// DM_VK_PLACE_PART_MB switch. A pool's registered size is not necessarily
+// unique resident RAM: NVN pools can overlap and share Vulkan segments.
 static void placed_line(uint64_t tot) {
     pthread_mutex_lock(&g_pmu); int n = g_npool, nl = atomic_load(&g_nlazy), np = 0; uint64_t lb = g_lazy_bytes;
-    for (int i = 0; i < g_npool; i++) if (g_pool[i].lazy && g_pool[i].pbytes) np++;
+    uint64_t whole_bytes[4] = {0}, waiting_bytes[4] = {0}, part_bytes = 0;
+    int whole_n[4] = {0}, waiting_n[4] = {0}, part_n = 0;
+    for (int i = 0; i < g_npool; i++) {
+        const pool_ent *p = &g_pool[i];
+        if (p->lazy && p->pbytes) np++;
+        if (p->part && p->pbytes) { part_n++; part_bytes += p->pbytes; }
+        int bucket = p->size >= (1024ull << 20) ? 3 : p->size >= (256ull << 20) ? 2 :
+                     p->size >= (128ull << 20) ? 1 : p->size >= (64ull << 20) ? 0 : -1;
+        if (bucket < 0) continue;
+        if (!p->lazy) { whole_n[bucket]++; whole_bytes[bucket] += p->size; }
+        else { waiting_n[bucket]++; waiting_bytes[bucket] += p->size; }
+    }
     pthread_mutex_unlock(&g_pmu);
     VLOG("%.2f GiB of memory pools is placed Vulkan memory (%d pools whole, %d by parts; %d pools, %.2f GiB not placed: no GPU address taken in them yet)", tot / 1073741824.0, n - nl, np, nl, lb / 1073741824.0);
+    // Once the scene starts growing, show whether making 128-1023 MiB
+    // pools partially placed could reduce the large allocation cliff.
+    if (tot >= (768ull << 20)) {
+        static _Atomic int nr;
+        if (atomic_fetch_add(&nr, 1) < 6)
+            VLOG("placed pool census: full pool registrations [64,128) %d/%.0f MiB, [128,256) %d/%.0f MiB, [256,1024) %d/%.0f MiB, >=1024 %d/%.0f MiB; not fully placed [64,128) %d/%.0f, [128,256) %d/%.0f, [256,1024) %d/%.0f, >=1024 %d/%.0f MiB; partially placed %d pools, %.0f MiB of parts (registrations may overlap)",
+                 whole_n[0], whole_bytes[0] / 1048576.0, whole_n[1], whole_bytes[1] / 1048576.0,
+                 whole_n[2], whole_bytes[2] / 1048576.0, whole_n[3], whole_bytes[3] / 1048576.0,
+                 waiting_n[0], waiting_bytes[0] / 1048576.0, waiting_n[1], waiting_bytes[1] / 1048576.0,
+                 waiting_n[2], waiting_bytes[2] / 1048576.0, waiting_n[3], waiting_bytes[3] / 1048576.0,
+                 part_n, part_bytes / 1048576.0);
+    }
 }
 static void maps_start(void);
 void mtl_pool_add(const void *mem, uint64_t size) {
@@ -942,6 +968,13 @@ void mtl_pool_need(const void *addr, uint64_t len, const char *why) {
         else if (whole && pe.pbytes) VLOG("memory pool %#lx+%#llx placed whole after %u parts (%.0f MiB) when the GPU was given %#lx+%#lx (%s; %.1f ms): ranges across the parts' ends lie in two segments",
                                          (unsigned long)pe.mem, (unsigned long long)pe.size, nparts, pe.pbytes / 1048576.0, (unsigned long)a, (unsigned long)(e - a), why, (mono_ns() - t0) / 1e6);
         else if (whole && first) VLOG("memory pool %#lx+%#llx placed when the GPU was given %#lx+%#lx (%s; %.1f ms)", (unsigned long)pe.mem, (unsigned long long)pe.size, (unsigned long)a, (unsigned long)(e - a), why, (mono_ns() - t0) / 1e6);
+        if (placed && whole && pe.size >= (128ull << 20)) {
+            static _Atomic int nb;
+            if (atomic_fetch_add(&nb, 1) < 24)
+                VLOG("large pool whole placement: %#lx+%.0f MiB for GPU request %#lx+%.2f MiB (%s), actually allocated %.0f MiB now; partial placement threshold %llu MiB (DM_VK_PLACE_PART_MB)",
+                     (unsigned long)pe.mem, pe.size / 1048576.0, (unsigned long)a, (e - a) / 1048576.0, why, mine / 1048576.0,
+                     (unsigned long long)(part_min() >> 20));
+        }
         else if (!whole && mine && (nparts <= 8 || !(nparts & 63)))
             VLOG("memory pool %#lx+%#llx: part %u, %#llx+%#llx (%.0f MiB), placed when the GPU was given %#lx+%#lx (%s; %.1f ms; %.0f MiB of the pool placed)", (unsigned long)pe.mem, (unsigned long long)pe.size, nparts,
                  (unsigned long long)plo, (unsigned long long)(phi - plo), mine / 1048576.0, (unsigned long)a, (unsigned long)(e - a), why, (mono_ns() - t0) / 1e6, (pe.pbytes + mine) / 1048576.0);
