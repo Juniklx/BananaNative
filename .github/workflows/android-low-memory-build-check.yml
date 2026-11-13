@@ -1,0 +1,51 @@
+# Build-only APK for validating Android native code changes on a GitHub-hosted runner.
+# The fake packer does NOT prepare real games. The default Donkey Kong Bananza profile is
+# compiled because this fork does not include the Zelda 0400486024DEC000 profile.
+name: Android low-memory build check
+
+on:
+  push:
+    branches:
+      - opt/android-low-memory-image-blocks
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Android SDK packages and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER" || { echo "::error::sdkmanager not found at $SDKMANAGER"; exit 1; }
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+          echo "sdk.dir=$SDK" > android/app/local.properties
+
+      - name: Compile native Android host and APK (test-only packer)
+        working-directory: android/app
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          ./gradlew --no-daemon -PnxGames=040074A01BF12000 -PnxPackEngine=fake -PnxApp=lowmem apk
+          test -s out/nxnative-android-lowmem.apk
+
+      - name: Upload compiled APK for build verification
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: banana-lowmem-build-check-NOT-ZELDA
+          path: android/app/out/nxnative-android-lowmem.apk
+          if-no-files-found: error
+          retention-days: 7
