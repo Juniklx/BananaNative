@@ -17,13 +17,13 @@
 #include <stdlib.h>
 
 #define UNIT 256ull
-#define BLOCK_DEFAULT (64ull << 20)
+#define BLOCK_DEFAULT_MB 64
 #define VKA_IMEM_MAX (4ull << 20)            // images of at least 4 MiB keep their own allocation
 // Opt-in low-memory tuning. Smaller blocks commit less unused memory, at the cost of more Vulkan allocations.
 // Only 16, 32 and 64 MiB are supported; an invalid value preserves the original 64 MiB behavior.
 static uint64_t block_size(void) {
-    int mb = VKA_ENV("DM_VK_IMGMEM_BLOCK_MB", 64);
-    if (mb != 16 && mb != 32 && mb != 64) mb = 64;
+    int mb = VKA_ENV("DM_VK_IMGMEM_BLOCK_MB", BLOCK_DEFAULT_MB);
+    if (mb != 16 && mb != 32 && mb != 64) mb = BLOCK_DEFAULT_MB;
     return (uint64_t)mb << 20;
 }
 typedef struct iblock { struct iblock *next; VkDeviceMemory dm; uint32_t type; uint64_t size; vke_list free; } iblock;
