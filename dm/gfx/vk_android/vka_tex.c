@@ -1790,8 +1790,11 @@ vka_img *vka_tex_get(const tex_t *t, VkCommandBuffer cb) {
             // Opt-in: evict eligible stale images before a large new dense allocation.
             // NVN storage is only an estimate of the driver's image-memory requirement;
             // GPU-in-flight, recently used and externally held images remain protected.
-            if (VKA_ENV("DM_VK_IMG_PREPRUNE", 0) && !base && !soft && !g_zwant &&
-                !(t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) && t->L.size >= 64 * VKTL_MIB)
+            // Do not exclude g_zwant: a 288 MiB depth ST_ZERO image exceeds the
+            // 32 MiB zero-sharing cap and must still trigger a cache-budget check.
+            if (VKA_ENV("DM_VK_IMG_PREPRUNE", 0) &&
+                vktl_preprune_candidate(t->L.size, base, soft,
+                                        (t->d.flags & NVN_TEXTURE_FLAGS_SPARSE) != 0))
                 vka_tex_prune_locked(t->L.size);
             im = img_create(t, &f, soft ? soft_levels(d_levels_of(t)) : base);
             g_zwant = 0;

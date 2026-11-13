@@ -85,6 +85,15 @@ int main(void) {
     CHECK(vktl_projected(409 * MIB, 288 * MIB) == 697 * MIB, "large image forecast before allocating");
     CHECK(vktl_projected(96 * MIB, 64 * MIB) < VKTL_FLOOR, "small starting cache needs no pre-prune");
     CHECK(vktl_projected(UINT64_MAX - 10, 32) == UINT64_MAX, "forecast saturates instead of wrapping");
+    // Regression: Zelda's 12,288x12,288 D16 depth image is ST_ZERO (g_zwant=1)
+    // but exceeds the 32 MiB zero-sharing cap; it must not skip the cache check.
+    CHECK(vktl_preprune_candidate(288 * MIB, 0, 0, 0), "large depth image still pre-prunes");
+    CHECK(vktl_preprune_candidate(64 * MIB, 0, 0, 0) && !vktl_preprune_candidate(64 * MIB - 1, 0, 0, 0),
+          "pre-prune starts at 64 MiB");
+    CHECK(!vktl_preprune_candidate(288 * MIB, 1, 0, 0) &&
+          !vktl_preprune_candidate(288 * MIB, 0, 1, 0) &&
+          !vktl_preprune_candidate(288 * MIB, 0, 0, 1),
+          "coarser, soft and sparse images are excluded");
 
     // A working set (1,800 MiB, 900 images of 2 MiB) over a 1,536 MiB limit: uploaded once, then kept over the limit, not again every frame
     int last = -1, up = run(1200, 900, 2 * MIB, 1536 * MIB, 120, &last);
