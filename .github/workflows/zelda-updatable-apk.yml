@@ -1,0 +1,151 @@
+# Experimental Zelda APK update channel.
+# Uses one app ID and one cached test signing keystore across pushes on this branch.
+# This is NOT a production release key. The cache can be evicted; when a signer
+# pin is present, fail closed rather than silently changing the signer.
+# The on-device packer is simulated; the user must import a prepared game pack.
+name: Zelda updatable APK
+
+on:
+  push:
+    branches: [opt/zelda-continuous-updates]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: zelda-updatable-signer
+  cancel-in-progress: false
+
+jobs:
+  build-updatable-apk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - name: Checkout stable Zelda update branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify Zelda profile and fileback regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dm/games/0400486024DEC000/game.tsv
+          cc -O1 -g -Wall -Werror -Wno-unused-function -Wno-misleading-indentation -fsanitize=address,undefined \
+            -o "$RUNNER_TEMP/t_android_fileback" dm/host/tests/t_android_fileback.c -lpthread
+          TMPDIR="$RUNNER_TEMP" "$RUNNER_TEMP/t_android_fileback"
+
+      - name: Restore stable test signer from GitHub Actions cache
+        id: signer
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: zelda-updates-debug-signing-v1
+
+      - name: Initialize or validate stable test signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYSTORE="$HOME/.android/debug.keystore"
+          mkdir -p "$HOME/.android"
+          if [ ! -s "$KEYSTORE" ]; then
+            if [ -s .github/zelda-update-signature.sha256 ]; then
+              echo "::error::The stable test signer cache was lost. Stop rather than rotate the signature and break app updates."
+              exit 1
+            fi
+            keytool -genkeypair -noprompt -keystore "$KEYSTORE" \
+              -storepass android -keypass android -alias androiddebugkey \
+              -dname "CN=Android Debug,O=Android,C=US" \
+              -keyalg RSA -keysize 2048 -validity 10000
+          fi
+          keytool -exportcert -rfc -keystore "$KEYSTORE" \
+            -storepass android -alias androiddebugkey \
+            | openssl x509 -inform PEM -outform DER \
+            | sha256sum | cut -d' ' -f1 > "$RUNNER_TEMP/signer-sha256.txt"
+          echo "Signing certificate SHA256: $(cat "$RUNNER_TEMP/signer-sha256.txt")" >> "$GITHUB_STEP_SUMMARY"
+          if [ -s .github/zelda-update-signature.sha256 ]; then
+            diff -w .github/zelda-update-signature.sha256 "$RUNNER_TEMP/signer-sha256.txt" || {
+              echo "::error::Signing certificate changed. Refusing to ship APK that cannot update the installed app."
+              exit 1
+            }
+          fi
+
+      - name: Save stable test signer (only on first build)
+        if: steps.signer.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: zelda-updates-debug-signing-v1
+
+      - name: Install Android build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358" "cmake;3.22.1"
+          echo "sdk.dir=$SDK" > android/app/local.properties
+
+      - name: Build SAME package with increasing versionCode
+        shell: bash
+        working-directory: android/app
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+          # Epoch seconds are monotonic across branch builds and fit Android's int versionCode until 2038.
+          VERSION_CODE="$(date -u +%s)"
+          echo "$VERSION_CODE" > "$RUNNER_TEMP/version-code.txt"
+          ./gradlew --no-daemon -PnxGames=0400486024DEC000 \
+            -PnxPackEngine=fake -PnxApp=zeldareclaim2 \
+            "-PnxVersionCode=$VERSION_CODE" \
+            -PnxLabel="Banana Native Zelda" apk
+          APK=out/nxnative-android-zeldareclaim2.apk
+          test -s "$APK"
+          sha256sum "$APK" | tee "$RUNNER_TEMP/apk-sha256.txt"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$APK" > "$RUNNER_TEMP/apk-signer.txt"
+          CERT="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/apk-signer.txt" | head -1)"
+          test -n "$CERT"
+          test "$CERT" = "$(cat "$RUNNER_TEMP/signer-sha256.txt")"
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging "$APK" | grep -F "package: name='dev.nxnative.android.zeldareclaim2' versionCode='$VERSION_CODE'" 
+          echo "APK package: dev.nxnative.android.zeldareclaim2, versionCode: $VERSION_CODE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compare certificate with previous installed test channel
+        shell: bash
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/previous"
+          gh run download 43352307447 -R "$GITHUB_REPOSITORY" \
+            -n zelda-reclaim-v2-APK-prepared-pack-required \
+            -D "$RUNNER_TEMP/previous"
+          OLD="$(find "$RUNNER_TEMP/previous" -type f -name 'nxnative-android-zeldareclaim2.apk' -print -quit)"
+          test -n "$OLD"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$OLD" > "$RUNNER_TEMP/previous-signer.txt"
+          OLD_CERT="$(sed -n 's/^Signer #1 certificate SHA-256 digest: //p' "$RUNNER_TEMP/previous-signer.txt" | head -1)"
+          NEW_CERT="$(cat "$RUNNER_TEMP/signer-sha256.txt")"
+          if [ "$OLD_CERT" = "$NEW_CERT" ]; then
+            echo "Previous zeldareclaim2 signer matches: you can install this APK over the old one." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Previous zeldareclaim2 signer differs: ONE clean reinstall is required for this stable update channel." >> "$GITHUB_STEP_SUMMARY"
+            echo "::warning::Signer differs from run 43352307447: one-time reinstall required."
+          fi
+
+      - name: Upload updatable APK and public fingerprints
+        if: success()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: zelda-updatable-APK-existing-pack-required
+          path: |
+            android/app/out/nxnative-android-zeldareclaim2.apk
+            ${{ runner.temp }}/apk-sha256.txt
+            ${{ runner.temp }}/signer-sha256.txt
+            ${{ runner.temp }}/version-code.txt
+          if-no-files-found: error
+          retention-days: 30
