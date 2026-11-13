@@ -64,6 +64,11 @@ static int take(iblock *b, uint32_t n, uint32_t al, const VkMemoryRequirements *
 // VK_SUCCESS, or the Vulkan error with nothing allocated
 VkResult vka_imem_bind(VkImage img, uint32_t type, const VkMemoryRequirements *mr, vka_imem *m) {
     memset(m, 0, sizeof *m);
+    // Once per launch, confirm that the native allocator (not just the UI) read the settings.
+    static _Atomic int settings_logged;
+    if (!atomic_exchange(&settings_logged, 1))
+        VLOG("image memory blocks: %llu MiB each, keep last empty block %d (DM_VK_IMGMEM_BLOCK_MB / DM_VK_IMGMEM_KEEP_EMPTY)",
+             (unsigned long long)(block_size() >> 20), VKA_ENV("DM_VK_IMGMEM_KEEP_EMPTY", 1));
     if (!sharable(img, type, mr)) return dedicated(img, type, mr, m);
     uint32_t n = (uint32_t)((mr->size + UNIT - 1) / UNIT), al = mr->alignment > UNIT ? (uint32_t)(mr->alignment / UNIT) : 1;
     if (al & (al - 1)) return dedicated(img, type, mr, m);   // (Vulkan alignments are powers of two)
