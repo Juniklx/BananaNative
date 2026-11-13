@@ -38,7 +38,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git clone --depth=1 --single-branch --branch android \
+          git clone --single-branch --branch android \
             https://git.eden-emu.dev/moceure/BananaNative.git "$RUNNER_TEMP/eden"
           git -C "$RUNNER_TEMP/eden" rev-parse HEAD | tee "$RUNNER_TEMP/eden-sha.txt"
           test -s "$RUNNER_TEMP/eden/dm/games/0400486024DEC000/game.tsv"
