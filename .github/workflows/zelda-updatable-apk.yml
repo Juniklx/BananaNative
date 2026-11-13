@@ -36,6 +36,10 @@ jobs:
           cc -O1 -g -Wall -Werror -Wno-unused-function -Wno-misleading-indentation -fsanitize=address,undefined \
             -o "$RUNNER_TEMP/t_android_fileback" dm/host/tests/t_android_fileback.c -lpthread
           TMPDIR="$RUNNER_TEMP" "$RUNNER_TEMP/t_android_fileback"
+          cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
+            -o "$RUNNER_TEMP/t_vka_scratch_policy" dm/host/tests/t_vka_scratch_policy.c
+          "$RUNNER_TEMP/t_vka_scratch_policy"
+          grep -q '^DM_VK_SCRATCH_IDLE_MB[[:space:]]' docs/env_switches.tsv
 
       - name: Restore stable test signer from GitHub Actions cache
         id: signer
