@@ -83,6 +83,22 @@ int main(void) {
         CHECK(pread(fd, &b, 1, off + 60 * PG) == 1 && b == 0x5A,
               "PAGEOUT kept the file's contents");
     }
+    // The new telemetry is advisory too: mincore reports cached mapped pages,
+    // and fadvise may return success even if those pages remain resident.
+    uint64_t before = 0, after = 0;
+    CHECK(vkfb_resident_bytes((uintptr_t)g_lo, NP * PG, &before) == 0,
+          "mincore before fadvise succeeded");
+    int fadv = vkfb_fadv_dontneed(fd, (uint64_t)off, NP * PG);
+    CHECK(fadv == 0, "FADV_DONTNEED accepted on the test file (%d)", fadv);
+    CHECK(vkfb_resident_bytes((uintptr_t)g_lo, NP * PG, &after) == 0,
+          "mincore after fadvise succeeded");
+    CHECK(before <= NP * PG && after <= NP * PG,
+          "mapped resident-page counts are within the file range");
+    CHECK(g_lo[5 * PG + 100] == 0xAB && g_lo[60 * PG] == 0x5A,
+          "FADV_DONTNEED preserves shared mapping contents");
+    CHECK(pread(fd, &b, 1, off + 60 * PG) == 1 && b == 0x5A,
+          "FADV_DONTNEED preserves file bytes");
+
 
 
     // the dirty tracker's protection on the shared mapping: the write faults, the handler opens the page, the write lands

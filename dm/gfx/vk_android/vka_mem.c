@@ -1456,24 +1456,42 @@ void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) {   // hle_n
         int sr = sync_file_range(g_fb_fd, off, (off64_t)size,
                                  SYNC_FILE_RANGE_WRITE | (reclaim ? SYNC_FILE_RANGE_WAIT_AFTER : 0));
         if (reclaim) {
-            int adv = sr ? -errno : -EAGAIN;
+            // Keep the results separate: the previous log said only "Device or resource busy",
+            // which could have come from writeback or MADV_PAGEOUT. mincore measures page-cache
+            // residency but not PSS, RAM actually released, or total process footprint.
+            int sync_err = sr ? errno : 0, live = 0, adv = -EAGAIN, fad = -EAGAIN;
+            int advise_started = 0, fadv_started = 0, resident_ok = 0;
+            uint64_t resident_before = 0, resident_after = 0;
             if (!sr) {
                 // The pool may have been finalized or placed since g_pl was released. Never
-                // advise a remapped GPU/anonymous range: take the placement lock and verify
+                // advise a remapped GPU/anonymous range: hold the placement lock and verify
                 // that the same file piece still covers the entire original pool.
                 pthread_mutex_lock(&g_pl);
                 pthread_mutex_lock(&g_fbmu);
-                int live = 0;
                 for (int i = 0; i < g_fb.n; i++)
                     if (g_fb.p[i].lo == lo && g_fb.p[i].hi == hi && g_fb.p[i].off == (uint64_t)off) { live = 1; break; }
                 pthread_mutex_unlock(&g_fbmu);
-                if (live) adv = vkfb_pageout(lo, (size_t)size);
+                if (live) {
+                    resident_ok = !vkfb_resident_bytes(lo, (size_t)size, &resident_before);
+                    adv = vkfb_pageout(lo, (size_t)size);
+                    advise_started = 1;
+                    if (adv && VKA_ENV("DM_MEM_FILEBACK_FADVISE", 0)) {
+                        fad = vkfb_fadv_dontneed(g_fb_fd, (uint64_t)off, (size_t)size);
+                        fadv_started = 1;
+                    }
+                    if (resident_ok) resident_ok = !vkfb_resident_bytes(lo, (size_t)size, &resident_after);
+                }
                 pthread_mutex_unlock(&g_pl);
             }
             static _Atomic int pageout_logs;
             if (atomic_fetch_add(&pageout_logs, 1) < 16)
-                VLOG("file-backed pools: PAGEOUT texture pool %#lx+%.1f MiB, %.1f MiB copied: %s (DM_MEM_FILEBACK_PAGEOUT=1; kernel acceptance does not prove RAM reclaimed)",
-                     (unsigned long)lo, size / 1048576.0, copied / 1048576.0, adv ? strerror(-adv) : "accepted");
+                VLOG("file-backed pools: PAGEOUT texture pool %#lx+%.1f MiB, %.1f MiB copied: sync %s, mapping %s, MADV_PAGEOUT %s, FADV_DONTNEED %s; mapped cache resident %s%.1f -> %.1f MiB (requested hints do not guarantee reclaimed RAM)",
+                     (unsigned long)lo, size / 1048576.0, copied / 1048576.0,
+                     sync_err ? strerror(sync_err) : "ok", live ? "unchanged" : "changed/unknown",
+                     advise_started ? (adv ? strerror(-adv) : "accepted") : "not attempted",
+                     fadv_started ? (fad ? strerror(-fad) : "accepted") : "not attempted",
+                     resident_ok ? "" : "unavailable: ",
+                     resident_before / 1048576.0, resident_after / 1048576.0);
         }
     }   // without the opt-in, writeback remains asynchronous as before
 }

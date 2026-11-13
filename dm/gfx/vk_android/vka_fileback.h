@@ -70,6 +70,26 @@ static inline int vkfb_punch(int fd, uint64_t off, uint64_t n) { return fallocat
 static inline int vkfb_pageout(uintptr_t lo, size_t n) {
     return madvise((void *)lo, n, MADV_PAGEOUT) ? -errno : 0;
 }
+// Measure pages currently resident in the page cache of this mapped file range.
+// mincore reports residency, not unique process RSS or an actual reduction in RAM use.
+static inline int vkfb_resident_bytes(uintptr_t lo, size_t n, uint64_t *bytes) {
+    size_t count = (n + VKFB_PG - 1) / VKFB_PG;
+    unsigned char *vec = malloc(count);
+    if (!vec) return -ENOMEM;
+    int rc = mincore((void *)lo, n, vec);
+    if (rc) { int e = errno; free(vec); return -e; }
+    uint64_t pages = 0;
+    for (size_t i = 0; i < count; ++i) pages += vec[i] & 1;
+    free(vec);
+    *bytes = pages * VKFB_PG;
+    return 0;
+}
+// File-level alternative when the mapping hint is refused. fadvise is advisory,
+// retains every file byte, and may not drop pages still mapped in any process.
+static inline int vkfb_fadv_dontneed(int fd, uint64_t off, size_t n) {
+    int rc = posix_fadvise(fd, (off_t)off, (off_t)n, POSIX_FADV_DONTNEED);
+    return rc ? -rc : 0;
+}
 static inline int vkfb_zero_page(const void *p) { const uint64_t *w = (const uint64_t *)p; uint64_t o = 0; for (int i = 0; i < VKFB_PG / 8; i++) o |= w[i]; return !o; }
 // Pages of [a, a + 4096 k) with data: pagemap bits 63 (present) or 62 (swapped). pm < 0, or a read that fails: every page counts (the zero check still skips empty ones)
 static inline void vkfb_touched(int pm, uintptr_t a, size_t k, uint8_t *t) {
