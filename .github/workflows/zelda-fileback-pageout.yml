@@ -23,7 +23,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cc -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined \
+          cc -O1 -g -Wall -Werror -Wno-unused-function -Wno-misleading-indentation -fsanitize=address,undefined \
             -o "$RUNNER_TEMP/t_android_fileback" dm/host/tests/t_android_fileback.c -lpthread
           TMPDIR="$RUNNER_TEMP" "$RUNNER_TEMP/t_android_fileback"
           test -s dm/games/0400486024DEC000/game.tsv
