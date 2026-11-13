@@ -50,6 +50,7 @@ jobs:
           set -euo pipefail
           KEYSTORE="$HOME/.android/debug.keystore"
           mkdir -p "$HOME/.android"
+          echo "NX_TEST_SIGN_STORE=$KEYSTORE" >> "$GITHUB_ENV"
           if [ ! -s "$KEYSTORE" ]; then
             if [ -s .github/zelda-update-signature.sha256 ]; then
               echo "::error::The stable test signer cache was lost. Stop rather than rotate the signature and break app updates."
