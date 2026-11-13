@@ -72,6 +72,19 @@ int main(void) {
     // a later write to a page never touched before goes to the file too (the game filling the pool)
     g_lo[60 * PG] = 0x5A; CHECK(pread(fd, &b, 1, off + 60 * PG) == 1 && b == 0x5A, "a later write is in the file");
 
+    // The reclaim hint is advisory and may be unavailable on older kernels. When
+    // accepted, reading/writing through the shared mapping must preserve the bytes.
+    int pageout = vkfb_pageout((uintptr_t)g_lo, NP * PG);
+    CHECK(!pageout || pageout == -EINVAL || pageout == -ENOSYS || pageout == -EOPNOTSUPP,
+          "PAGEOUT hint either accepted or unsupported by this kernel: %d", pageout);
+    if (!pageout) {
+        CHECK(g_lo[5 * PG + 100] == 0xAB && g_lo[60 * PG] == 0x5A,
+              "PAGEOUT kept both original and later-written bytes");
+        CHECK(pread(fd, &b, 1, off + 60 * PG) == 1 && b == 0x5A,
+              "PAGEOUT kept the file's contents");
+    }
+
+
     // the dirty tracker's protection on the shared mapping: the write faults, the handler opens the page, the write lands
     mprotect(g_lo + 21 * PG, PG, PROT_READ); atomic_store(&g_track, (uintptr_t)(g_lo + 21 * PG));
     g_lo[21 * PG + 7] = 0x77;

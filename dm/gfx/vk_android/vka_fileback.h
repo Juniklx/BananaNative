@@ -60,6 +60,16 @@ static inline int64_t vkfb_alloc(int fd, uint64_t *next, uint64_t n) {
     *next = e; return (int64_t)off;
 }
 static inline int vkfb_punch(int fd, uint64_t off, uint64_t n) { return fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)off, (off_t)n) ? -errno : 0; }
+// Best-effort Linux page-cache reclaim hint for a file-backed guest pool.
+// PAGEOUT writes back dirty file pages and can evict clean ones without changing
+// their bytes. It is advisory: success is not a guarantee that any RAM was freed.
+// Android/Linux 5.4+; other kernels can refuse it with EINVAL/ENOSYS.
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
+static inline int vkfb_pageout(uintptr_t lo, size_t n) {
+    return madvise((void *)lo, n, MADV_PAGEOUT) ? -errno : 0;
+}
 static inline int vkfb_zero_page(const void *p) { const uint64_t *w = (const uint64_t *)p; uint64_t o = 0; for (int i = 0; i < VKFB_PG / 8; i++) o |= w[i]; return !o; }
 // Pages of [a, a + 4096 k) with data: pagemap bits 63 (present) or 62 (swapped). pm < 0, or a read that fails: every page counts (the zero check still skips empty ones)
 static inline void vkfb_touched(int pm, uintptr_t a, size_t k, uint8_t *t) {

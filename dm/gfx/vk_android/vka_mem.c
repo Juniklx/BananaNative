@@ -1448,7 +1448,34 @@ void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) {   // hle_n
         VRED("file-backed pools: pool %#lx+%#llx (%s) not moved: %s%s; it stays anonymous memory with its bytes. %s", (unsigned long)lo, (unsigned long long)size, what,
              known ? strerror(-r) : "its protections were not read or a page of it is not mapped", lost ? " (the range was taken down by the failed mremap and mapped again from the copy)" : "", st); }
     else if (nlog) VLOG("file-backed pools: pool %#lx+%.1f MiB (%s): %.1f MiB of data moved to the file (%.1f ms); %s", (unsigned long)lo, size / 1048576.0, what, copied / 1048576.0, (mono_ns() - t0) / 1e6, st);
-    if (!r) sync_file_range(g_fb_fd, off, (off64_t)size, SYNC_FILE_RANGE_WRITE);   // its dirty pages start to go to flash now (no wait), so they are clean, and droppable, sooner
+    if (!r) {
+        // Normally just start asynchronous writeback, as before. Under the experimental opt-in,
+        // finish writing a large texture pool first, then ask the kernel to evict its file-backed
+        // pages. This is a memory/I-O tradeoff, not a change to the pool's contents.
+        int reclaim = kind == 2 && copied >= 16ull * 1048576 && VKA_ENV("DM_MEM_FILEBACK_PAGEOUT", 0);
+        int sr = sync_file_range(g_fb_fd, off, (off64_t)size,
+                                 SYNC_FILE_RANGE_WRITE | (reclaim ? SYNC_FILE_RANGE_WAIT_AFTER : 0));
+        if (reclaim) {
+            int adv = sr ? -errno : -EAGAIN;
+            if (!sr) {
+                // The pool may have been finalized or placed since g_pl was released. Never
+                // advise a remapped GPU/anonymous range: take the placement lock and verify
+                // that the same file piece still covers the entire original pool.
+                pthread_mutex_lock(&g_pl);
+                pthread_mutex_lock(&g_fbmu);
+                int live = 0;
+                for (int i = 0; i < g_fb.n; i++)
+                    if (g_fb.p[i].lo == lo && g_fb.p[i].hi == hi && g_fb.p[i].off == (uint64_t)off) { live = 1; break; }
+                pthread_mutex_unlock(&g_fbmu);
+                if (live) adv = vkfb_pageout(lo, (size_t)size);
+                pthread_mutex_unlock(&g_pl);
+            }
+            static _Atomic int pageout_logs;
+            if (atomic_fetch_add(&pageout_logs, 1) < 16)
+                VLOG("file-backed pools: PAGEOUT texture pool %#lx+%.1f MiB, %.1f MiB copied: %s (DM_MEM_FILEBACK_PAGEOUT=1; kernel acceptance does not prove RAM reclaimed)",
+                     (unsigned long)lo, size / 1048576.0, copied / 1048576.0, adv ? strerror(-adv) : "accepted");
+        }
+    }   // without the opt-in, writeback remains asynchronous as before
 }
 // A placement replaced [lo, hi) (caller holds g_pl): file-backed pieces there are no longer mapped; their file ranges are punched (the bytes went into the placed memory)
 static void fb_placed(uintptr_t lo, uintptr_t hi) {
