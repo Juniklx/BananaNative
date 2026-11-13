@@ -51,9 +51,9 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x ./gradlew
-          ./gradlew --no-daemon -PnxGames=0400486024DEC000 -PnxPackEngine=fake -PnxApp=zelda8gb apk
-          test -s out/nxnative-android-zelda8gb.apk
-          sha256sum out/nxnative-android-zelda8gb.apk | tee "$RUNNER_TEMP/zelda-apk-sha256.txt"
+          ./gradlew --no-daemon -PnxGames=0400486024DEC000 -PnxPackEngine=fake -PnxApp=zeldamem2 apk
+          test -s out/nxnative-android-zeldamem2.apk
+          sha256sum out/nxnative-android-zeldamem2.apk | tee "$RUNNER_TEMP/zelda-apk-sha256.txt"
 
       - name: Upload APK and fingerprint
         if: success()
@@ -61,7 +61,7 @@ jobs:
         with:
           name: zelda-eden-lowmem-verified-existing-pack-required
           path: |
-            android/app/out/nxnative-android-zelda8gb.apk
+            android/app/out/nxnative-android-zeldamem2.apk
             ${{ runner.temp }}/zelda-apk-sha256.txt
           if-no-files-found: error
           retention-days: 7
