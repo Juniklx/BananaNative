@@ -1679,6 +1679,10 @@ static void vka_tex_prune_locked(uint64_t incoming) {
     static prune_ent *c; static int ccap; int nc = 0;
     if (ccap < g_nlive) { ccap = g_nlive + 256; c = realloc(c, (size_t)ccap * sizeof *c); }
     uint64_t done_fence = vka_done(); int video = dm_movie_playing();
+    // Diagnostic only: count why images cannot be pruned. Never changes eviction.
+    int diag = VKA_ENV("DM_VK_PRUNE_DIAG", 0);
+    int diag_pool = 0, diag_holds = 0, diag_fence = 0, diag_video = 0;
+    int diag_recent = 0, diag_gpu_grace = 0, diag_never = 0;
     // A texture a shader reads only through the pool (a bindless handle from a record in a storage buffer: Ocarina of Time's lightmaps) is never bound by a draw,
     // so its last_frame does not move: evicting it rewrote its slot (redirty_ids), write_tex made it again at the next submission, and the cache evicted and
     // remade thousands of images a second (Turnip under 1 fps, a crash in Qualcomm's driver). An image a live pool slot names is in use: it stays, and a working
@@ -1693,9 +1697,29 @@ static void vka_tex_prune_locked(uint64_t incoming) {
         }
     for (int i = 0; i < g_nlive; i++) {
         vka_img *im = g_live[i];
-        if (pool_keep && im->pool_frame == cur_frame) continue;
-        if (vktl_evictable(cur_frame, im->last_frame, im->holds, im->gpu_owned, im->is_video && video, im->last_fence && done_fence < im->last_fence))
+        if (pool_keep && im->pool_frame == cur_frame) { if (diag) diag_pool++; continue; }
+        int pending = im->last_fence && done_fence < im->last_fence;
+        if (vktl_evictable(cur_frame, im->last_frame, im->holds, im->gpu_owned, im->is_video && video, pending))
             c[nc++] = (prune_ent){im, im->last_frame, im->gpu_owned != 0};
+        else if (diag) {
+            // Exclusive categories, in the same precedence as vktl_evictable.
+            if (im->holds) diag_holds++;
+            else if (im->is_video && video) diag_video++;
+            else if (pending) diag_fence++;
+            else if (!im->last_frame || cur_frame <= im->last_frame) diag_never++;
+            else if (im->gpu_owned) diag_gpu_grace++;
+            else diag_recent++;
+        }
+    }
+    if (diag) {
+        static uint64_t last_diag_frame;
+        if (!last_diag_frame || cur_frame >= last_diag_frame + 60) {
+            last_diag_frame = cur_frame;
+            VLOG("image prune diag: frame %llu, images %d, eligible %d, pool %d, held %d, fence %d, video %d, never/current %d, recent %d, gpu-grace %d; cache %.1f MiB, incoming %.1f MiB, limit %.1f MiB",
+                 (unsigned long long)cur_frame, g_nlive, nc, diag_pool, diag_holds, diag_fence,
+                 diag_video, diag_never, diag_recent, diag_gpu_grace,
+                 total_bytes / 1048576.0, incoming / 1048576.0, limit_bytes / 1048576.0);
+        }
     }
     qsort(c, (size_t)nc, sizeof *c, prune_cmp);
     uint64_t target = vktl_target(limit_bytes), bytes_freed = 0; int pruned = 0;
