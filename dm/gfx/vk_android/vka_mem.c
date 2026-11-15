@@ -1600,10 +1600,21 @@ void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) {   // hle_n
     char st[400];
     pthread_mutex_lock(&g_fbmu);
     if (!r && !vkfb_tab_add(&g_fb, lo, hi, (uint64_t)off)) r = -ENOMEM;   // (not in the table: it would never go back; a table that cannot grow is a failure, the pool is moved back below)
-    int nlog = 0; if (!r) { g_fbs.pools++; g_fbs.moved += copied; atomic_store(&g_fb_n, g_fb.n); nlog = g_fbs.pools <= 8 || !(g_fbs.pools & 63); } else g_fbs.fails++;
+    int nlog = 0, candidate_added = 0;
+    if (!r) {
+        g_fbs.pools++; g_fbs.moved += copied; atomic_store(&g_fb_n, g_fb.n);
+        nlog = g_fbs.pools <= 8 || !(g_fbs.pools & 63);
+        if (kind == 2 && VKA_ENV("DM_MEM_FILEBACK_RECLAIM", 0) && vkfr_candidate(size, copied)) {
+            if (g_nfbr < FBRC_MAX) {
+                g_fbr[g_nfbr++] = (fbr_cand){.lo=lo, .hi=hi, .off=(uint64_t)off, .born=mono_ns()};
+                candidate_added = 1;
+            } else VRED_ONCE("file-backed deferred PAGEOUT: candidate table full (%d), later pools unmonitored", FBRC_MAX);
+        }
+    } else g_fbs.fails++;
     if (r && r != -ENOMEM) vkfb_punch(g_fb_fd, (uint64_t)off, size);
     fb_line(st, sizeof st);
     pthread_mutex_unlock(&g_fbmu);
+    if (candidate_added) pthread_once(&g_fbr_once, fbr_start_once);
     if (r == -ENOMEM && known) {   // moved, but not recorded: back to anonymous memory now
         pthread_mutex_lock(&g_pl); swap_begin(lo, hi); prot_readonly(pr, npr); uint64_t c2; int l2;
         int r2 = vkfb_to_anon(g_fb_fd, (uint64_t)off, lo, size, rr, nrr, &c2, &l2); if (!r2 || l2) plat_mem_name_guest((void *)lo, size); prot_apply(pr, npr); swap_end_ok(0); swap_end(); pthread_mutex_unlock(&g_pl);
