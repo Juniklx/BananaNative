@@ -10,6 +10,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -41,6 +42,7 @@ int main(void) {
     CHECK(!vkfb_pageout_policy(2, 0, 0, 20.0), "unknown meminfo fails closed");
     CHECK(!vkfb_pageout_policy(2, total, 0, 20.0), "unknown MemAvailable fails closed");
     CHECK(!vkfb_pageout_policy(2, total, reserve, -1.0), "unknown PSI fails closed");
+    CHECK(!vkfb_pageout_policy(2, total, reserve, NAN), "invalid PSI fails closed");
     CHECK(!vkfb_pageout_policy(2, total, reserve, 4.9), "low PSI prevents reclaim");
     CHECK(!vkfb_pageout_policy(2, total, 3ull * 1024 * 1024, 20.0), "ample RAM prevents reclaim");
     CHECK(vkfb_pageout_policy(2, total, reserve, 5.0), "pressure at reserve and PSI threshold");
