@@ -1,0 +1,30 @@
+# Registers the Zelda update workflow on the default branch so GitHub can dispatch
+# the full build workflow stored on opt/zelda-continuous-updates.
+# No APK is built from the default branch; signing remains in the Zelda branch.
+name: Zelda updatable APK
+
+on:
+  push:
+    paths:
+      - '.github/workflows/zelda-updatable-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch-zelda-branch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Start Zelda branch APK build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The target ref contains the full workflow, including signer checks.
+          gh workflow run zelda-updatable-apk.yml --ref opt/zelda-continuous-updates
+          echo "Dispatched Zelda APK workflow on opt/zelda-continuous-updates" >> "$GITHUB_STEP_SUMMARY"
