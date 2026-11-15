@@ -855,9 +855,9 @@ static void os_memlog(void) {
             if ((v = os_mem_kb(line, "Pss"))) pss = v;
             else if ((v = os_mem_kb(line, "Rss"))) rss = v;
             else if ((v = os_mem_kb(line, "SwapPss"))) swap_pss = v;
-            else if ((v = os_mem_kb(line, "Pss_Anon"))) { pss_anon = v; pss_classes |= 1; }
-            else if ((v = os_mem_kb(line, "Pss_File"))) { pss_file = v; pss_classes |= 2; }
-            else if ((v = os_mem_kb(line, "Pss_Shmem"))) { pss_shmem = v; pss_classes |= 4; }
+            else if (!strncmp(line, "Pss_Anon:", 9)) { pss_anon = os_mem_kb(line, "Pss_Anon"); pss_classes |= 1; }
+            else if (!strncmp(line, "Pss_File:", 9)) { pss_file = os_mem_kb(line, "Pss_File"); pss_classes |= 2; }
+            else if (!strncmp(line, "Pss_Shmem:", 10)) { pss_shmem = os_mem_kb(line, "Pss_Shmem"); pss_classes |= 4; }
         }
         rollup_ok = !ferror(f);
         fclose(f);
