@@ -39,6 +39,7 @@
 #include "vka_fd_alias.h"
 #include "vka_fileback.h"
 #include "vka_fileback_reclaim.h"
+#include "vka_swapmap_diag.h"
 
 static void fb_placed(uintptr_t lo, uintptr_t hi);           // File-backed pools (below): a placement took [lo, hi) from the file
 static void fb_gone(uintptr_t lo, uintptr_t hi, int back);   // a pool's range finalized (back 1: its pieces go back to anonymous memory) or released (0: dropped)
@@ -1518,9 +1519,63 @@ static int fbr_slice_locked(const fbr_cand *c, uintptr_t lo, uintptr_t hi,
     }
     return best >= VKFR_MIN_RESIDENT;
 }
+// A single, bounded /proc/self/smaps snapshot attributes SwapPss to the
+// process's actual mappings. This is diagnostic, not a reclaim operation.
+// It may be denied by SELinux, and VMAs can change during the read.
+static void fbr_swapdiag_record(const vksm_vma *v, uint64_t by_group[VKSM_GROUPS],
+                                vksm_vma top[VKSM_TOP], uint64_t *sum, int *n) {
+    (*n)++;
+    by_group[vksm_group(v->name)] += v->swap_kb;
+    *sum += v->swap_kb;
+    if (!v->swap_kb) return;
+    for (int i = 0; i < VKSM_TOP; i++) if (v->swap_kb > top[i].swap_kb) {
+        if (i + 1 < VKSM_TOP)
+            memmove(&top[i + 1], &top[i], (size_t)(VKSM_TOP - i - 1) * sizeof *top);
+        top[i] = *v;
+        return;
+    }
+}
+static void fbr_swapdiag_once(void) {
+    FILE *f = fopen("/proc/self/smaps", "r");
+    if (!f) {
+        VLOG("swapmap diagnostic: /proc/self/smaps unreadable (%s); no mapping attribution", strerror(errno));
+        return;
+    }
+    uint64_t by_group[VKSM_GROUPS] = {0}, sum = 0, read_bytes = 0;
+    vksm_vma top[VKSM_TOP] = {{0}}, cur = {0};
+    int have = 0, count = 0, truncated = 0;
+    char line[768];
+    while (fgets(line, sizeof line, f)) {
+        read_bytes += strlen(line);
+        if (read_bytes > VKSM_MAX_BYTES) { truncated = 1; break; }
+        vksm_vma found;
+        if (vksm_map_line(line, &found)) {
+            if (have) fbr_swapdiag_record(&cur, by_group, top, &sum, &count);
+            cur = found; have = 1;
+        } else if (have) {
+            uint64_t kb;
+            if (vksm_field_kb(line, "SwapPss:", &kb)) cur.swap_kb = kb;
+            else if (vksm_field_kb(line, "Rss:", &kb)) cur.rss_kb = kb;
+        }
+    }
+    if (have) fbr_swapdiag_record(&cur, by_group, top, &sum, &count);
+    int read_err = ferror(f);
+    fclose(f);
+    VLOG("swapmap diagnostic (one snapshot): %d VMAs, %.1f MiB SwapPss total; guest-named %.1f, GPU-named %.1f, other anonymous %.1f, file path %.1f MiB; %llu MiB smaps text scanned%s%s. This is approximate and not additive to Vulkan allocation accounting",
+         count, sum / 1024.0, by_group[VKSM_GUEST] / 1024.0, by_group[VKSM_GPU] / 1024.0,
+         by_group[VKSM_ANON] / 1024.0, by_group[VKSM_FILE] / 1024.0,
+         (unsigned long long)((read_bytes + 1048575) >> 20),
+         truncated ? " (SCAN LIMIT HIT: partial totals)" : "",
+         read_err ? " (smaps read error)" : "");
+    for (int i = 0; i < VKSM_TOP && top[i].swap_kb; i++)
+        VLOG("swapmap top #%d: SwapPss %.1f MiB, RSS %.1f MiB, address %#llx+%.1f MiB, %s",
+             i + 1, top[i].swap_kb / 1024.0, top[i].rss_kb / 1024.0,
+             (unsigned long long)top[i].lo, (top[i].hi - top[i].lo) / 1048576.0, top[i].name);
+}
 static void *fbr_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-fb-reclaim");
     unsigned consecutive = 0;
+    int swapdiag_done = 0;
     for (;;) {
         sleep(VKFR_POLL_SEC);
         if (!VKA_ENV("DM_MEM_FILEBACK_RECLAIM", 0)) { consecutive = 0; continue; }
@@ -1531,6 +1586,10 @@ static void *fbr_main(void *arg) {
         if (avail <= reserve) { if (consecutive < 3) consecutive++; }
         else { consecutive = 0; continue; }
         if (!vkfr_pressure(total, avail, consecutive)) continue;
+        if (!swapdiag_done && VKA_ENV("DM_VK_SWAPMAP_DIAG", 0)) {
+            swapdiag_done = 1;
+            fbr_swapdiag_once();  // once per run, without holding placement/file mutexes
+        }
         const uint64_t now = mono_ns();
         uintptr_t best_lo = 0, best_hi = 0; uint64_t best_off = 0, best_res = 0, after = 0;
         int best_idx = -1, checked = 0, available_pools = 0, failures = 0;
