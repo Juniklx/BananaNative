@@ -1483,7 +1483,7 @@ static int fbr_piece_live(uintptr_t lo, uintptr_t hi, uint64_t off) {
     // Caller holds g_fbmu. Partial placements may split the original pool.
     for (int i = 0; i < g_fb.n; i++) {
         const vkfb_piece *p = &g_fb.p[i];
-        if (p->lo <= lo && p->hi >= hi && p->off + (lo - p->lo) == off) return 1;
+        if (vkfr_piece_covers(p->lo, p->hi, p->off, lo, hi, off)) return 1;
     }
     return 0;
 }
