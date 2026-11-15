@@ -60,6 +60,17 @@ static inline int64_t vkfb_alloc(int fd, uint64_t *next, uint64_t n) {
     *next = e; return (int64_t)off;
 }
 static inline int vkfb_punch(int fd, uint64_t off, uint64_t n) { return fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)off, (off_t)n) ? -errno : 0; }
+// PAGEOUT modes: 0 off, 1 immediate (legacy, may refault during loading),
+// 2 conservative pressure-gated at the moment the pool becomes file-backed.
+// Missing PSI or meminfo fails closed. This is an admission policy only:
+// it never changes pool bytes, mapping permissions or Vulkan lifetimes.
+static inline int vkfb_pageout_policy(int mode, uint64_t total_kb, uint64_t avail_kb, double psi_some10) {
+    if (mode == 1) return 1;
+    if (mode != 2 || !total_kb || !avail_kb || psi_some10 < 5.0) return 0;
+    uint64_t reserve_kb = total_kb / 8;
+    if (reserve_kb < 512ull * 1024) reserve_kb = 512ull * 1024;
+    return avail_kb <= reserve_kb;
+}
 // Best-effort Linux page-cache reclaim hint for a file-backed guest pool.
 // PAGEOUT writes back dirty file pages and can evict clean ones without changing
 // their bytes. It is advisory: success is not a guarantee that any RAM was freed.
