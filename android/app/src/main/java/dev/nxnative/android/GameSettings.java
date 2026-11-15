@@ -155,7 +155,7 @@ final class GameSettings {
                 picture.add(new Ui.Setting(a, "✨", "FSR sharpness", v -> sharpness(a, g, again)).value(dflt(GameUpscaler.ownSharp(a, id), GameUpscaler.sharpName(a, id))).chevron(a).sub());
         }
         if (TextureQuality.supports(id))
-            picture.add(new Ui.Setting(a, "🧩", "Texture quality (experimental)", v -> textureQuality(a, g, again))
+            picture.add(new Ui.Setting(a, "🧩", "Texture quality", v -> textureQuality(a, g, again))
                     .value(TextureQuality.NAMES[Prefs.textureQuality(a, id)])
                     .note("Eligible packaged block-compressed textures only; the game's pools are unchanged. Restart to apply.")
                     .chevron(a));
