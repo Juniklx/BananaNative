@@ -833,6 +833,58 @@ static sblk *sblk_new(VkDeviceSize n) {
     b->ptr = p; atomic_fetch_add(&g_scratch_bytes, n); atomic_fetch_add(&g_scratch_n, 1); vka_mem_grew(n); return b;
 }
 uint64_t vka_scratch_bytes(uint32_t *blocks) { if (blocks) *blocks = atomic_load(&g_scratch_n); return atomic_load(&g_scratch_bytes); }
+// Opt-in Android process-memory context alongside Vulkan allocations. A device's
+// physical/RAM pressure is NOT the sum of Vulkan allocations: guest mappings,
+// compiler state, and shared GPU memory also count. Reading smaps_rollup may be
+// moderately costly, so it runs only when DM_VK_PROC_MEMLOG=1 and MEMLOG fires.
+static uint64_t os_mem_kb(const char *line, const char *key) {
+    size_t n = strlen(key);
+    return !strncmp(line, key, n) && line[n] == ':' ? strtoull(line + n + 1, NULL, 10) : 0;
+}
+static void os_memlog(void) {
+    if (!VKA_ENV("DM_VK_PROC_MEMLOG", 0)) return;
+    uint64_t pss = 0, rss = 0, swap_pss = 0, vmrss = 0, vmhwm = 0, vmswap = 0, available = 0;
+    int rollup_ok = 0, status_ok = 0;
+    char line[256];
+    FILE *f = fopen("/proc/self/smaps_rollup", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            uint64_t v;
+            if ((v = os_mem_kb(line, "Pss"))) pss = v;
+            else if ((v = os_mem_kb(line, "Rss"))) rss = v;
+            else if ((v = os_mem_kb(line, "SwapPss"))) swap_pss = v;
+        }
+        rollup_ok = !ferror(f);
+        fclose(f);
+    }
+    f = fopen("/proc/self/status", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            uint64_t v;
+            if ((v = os_mem_kb(line, "VmRSS"))) vmrss = v;
+            else if ((v = os_mem_kb(line, "VmHWM"))) vmhwm = v;
+            else if ((v = os_mem_kb(line, "VmSwap"))) vmswap = v;
+        }
+        status_ok = !ferror(f);
+        fclose(f);
+    }
+    f = fopen("/proc/meminfo", "r");
+    if (f) {
+        while (fgets(line, sizeof line, f)) {
+            if ((available = os_mem_kb(line, "MemAvailable"))) break;
+        }
+        fclose(f);
+    }
+    if (rollup_ok)
+        VLOG("memory process: smaps_rollup PSS %.1f MiB, RSS %.1f MiB, SwapPss %.1f MiB (includes shared mappings; not additive to Vulkan accounting)",
+             pss / 1024.0, rss / 1024.0, swap_pss / 1024.0);
+    else
+        VLOG("memory process: /proc/self/smaps_rollup unavailable (PSS not measured)");
+    if (status_ok)
+        VLOG("memory process: status VmRSS %.1f MiB, VmHWM %.1f MiB, VmSwap %.1f MiB; system MemAvailable %.1f MiB",
+             vmrss / 1024.0, vmhwm / 1024.0, vmswap / 1024.0, available / 1024.0);
+}
+
 void vka_mem_grew(uint64_t bytes) {
     static _Atomic uint64_t acc, step = 1;
     uint64_t s = atomic_load_explicit(&step, memory_order_relaxed);
@@ -842,6 +894,7 @@ void vka_mem_grew(uint64_t bytes) {
     int ni; uint32_t ns; uint64_t img = vka_tex_mem_nolock(&ni), scr = vka_scratch_bytes(&ns), pl = vka_mem_placed_nolock(), sp = vks_bytes_nolock();
     VLOG("memory: placed pools %.0f MiB, images %.0f MiB (%d), sparse tile blocks %.0f MiB, scratch %.0f MiB (%u blocks): %.0f MiB", pl / 1048576.0, img / 1048576.0, ni, sp / 1048576.0,
          scr / 1048576.0, ns, (pl + img + sp + scr) / 1048576.0);
+    os_memlog();
 }
 // Idle blocks (their value reached) larger than the standard 16 MiB, or beyond 64 MiB of idle blocks in all, are freed (under g_smu): at every miss and at every retire.
 // Kept, every block stayed for the process's life: Mario Kart World 1.8.0's boot uploads (levels of up to 144 MiB, each in a block of its size) left 1.4 GB of scratch
