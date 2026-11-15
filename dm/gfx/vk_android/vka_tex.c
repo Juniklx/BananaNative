@@ -1681,6 +1681,11 @@ static void vka_tex_prune_locked(uint64_t incoming) {
     uint64_t done_fence = vka_done(); int video = dm_movie_playing();
     // Diagnostic only: count why images cannot be pruned. Never changes eviction.
     int diag = VKA_ENV("DM_VK_PRUNE_DIAG", 0);
+    // The fence of a recording still in progress cannot complete on the GPU.
+    // Splitting completed/submitted/unsent fences is diagnostic only.
+    uint64_t queued_fence = diag ? vka_fence_queued() : 0;
+    int diag_fence_queued = 0, diag_fence_unsent = 0;
+    uint64_t diag_fence_queued_bytes = 0, diag_fence_unsent_bytes = 0;
     int diag_pool = 0, diag_holds = 0, diag_fence = 0, diag_video = 0;
     int diag_recent = 0, diag_gpu_grace = 0, diag_never = 0;
     uint64_t diag_bytes[8] = {0}; // eligible, pool, held, fence, video, never/current, recent, gpu grace
@@ -1710,7 +1715,11 @@ static void vka_tex_prune_locked(uint64_t incoming) {
             // Exclusive categories, in the same precedence as vktl_evictable.
             if (im->holds) { diag_holds++; diag_bytes[2] += im->bytes; }
             else if (im->is_video && video) { diag_video++; diag_bytes[4] += im->bytes; }
-            else if (pending) { diag_fence++; diag_bytes[3] += im->bytes; }
+            else if (pending) {
+                diag_fence++; diag_bytes[3] += im->bytes;
+                if (im->last_fence <= queued_fence) { diag_fence_queued++; diag_fence_queued_bytes += im->bytes; }
+                else { diag_fence_unsent++; diag_fence_unsent_bytes += im->bytes; }
+            }
             else if (!im->last_frame || cur_frame <= im->last_frame) { diag_never++; diag_bytes[5] += im->bytes; }
             else if (im->gpu_owned) { diag_gpu_grace++; diag_bytes[7] += im->bytes; }
             else { diag_recent++; diag_bytes[6] += im->bytes; }
@@ -1728,6 +1737,10 @@ static void vka_tex_prune_locked(uint64_t incoming) {
                  diag_bytes[0] / 1048576.0, diag_bytes[1] / 1048576.0, diag_bytes[2] / 1048576.0,
                  diag_bytes[3] / 1048576.0, diag_bytes[4] / 1048576.0, diag_bytes[5] / 1048576.0,
                  diag_bytes[6] / 1048576.0, diag_bytes[7] / 1048576.0);
+            VLOG("image prune fence diag: done %llu, queued %llu; pending GPU-queued %d images %.1f MiB, not-yet-queued %d images %.1f MiB (only pending images, excluding held/video/pool)",
+                 (unsigned long long)done_fence, (unsigned long long)queued_fence,
+                 diag_fence_queued, diag_fence_queued_bytes / 1048576.0,
+                 diag_fence_unsent, diag_fence_unsent_bytes / 1048576.0);
         }
     }
     qsort(c, (size_t)nc, sizeof *c, prune_cmp);
