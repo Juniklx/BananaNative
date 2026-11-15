@@ -1401,6 +1401,32 @@ static int fb_kinds(void) {   // bit 1 shader, bit 2 texture; 0 off
               if (!v && !strstr(ks, "shader") && !strstr(ks, "texture")) VRED("DM_MEM_FILEBACK_KINDS=%s names no kind (shader, texture): file-backed pools stay off", ks); }
     return v;
 }
+// Read live Android memory pressure only for PAGEOUT mode 2 and an eligible
+// large texture pool. Both sources must be readable; a partial read is not
+// evidence that evicting file-cache pages is appropriate.
+static int fb_pageout_pressured(uint64_t *total_kb, uint64_t *avail_kb, double *psi_some10) {
+    *total_kb = *avail_kb = 0; *psi_some10 = -1;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof line, f)) {
+            if (!strncmp(line, "MemTotal:", 9)) *total_kb = strtoull(line + 9, NULL, 10);
+            else if (!strncmp(line, "MemAvailable:", 13)) *avail_kb = strtoull(line + 13, NULL, 10);
+            if (*total_kb && *avail_kb) break;
+        }
+        fclose(f);
+    }
+    f = fopen("/proc/pressure/memory", "r");
+    if (f) {
+        char line[256];
+        if (fgets(line, sizeof line, f)) {
+            char *p = strstr(line, "some avg10=");
+            if (p) *psi_some10 = strtod(p + 11, NULL);
+        }
+        fclose(f);
+    }
+    return vkfb_pageout_policy(2, *total_kb, *avail_kb, *psi_some10);
+}
 static int64_t proc_write_bytes(void) {   // /proc/self/io write_bytes, -1 unknown
     FILE *f = fopen("/proc/self/io", "re"); if (!f) return -1;
     char ln[128]; long long v = -1; while (fgets(ln, sizeof ln, f)) if (sscanf(ln, "write_bytes: %lld", &v) == 1) break;
@@ -1485,7 +1511,18 @@ void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) {   // hle_n
         // Normally just start asynchronous writeback, as before. Under the experimental opt-in,
         // finish writing a large texture pool first, then ask the kernel to evict its file-backed
         // pages. This is a memory/I-O tradeoff, not a change to the pool's contents.
-        int reclaim = kind == 2 && copied >= 16ull * 1048576 && VKA_ENV("DM_MEM_FILEBACK_PAGEOUT", 0);
+        int pageout_mode = VKA_ENV("DM_MEM_FILEBACK_PAGEOUT", 0);
+        int candidate = kind == 2 && copied >= 16ull * 1048576;
+        uint64_t total_kb = 0, avail_kb = 0; double psi_some10 = -1;
+        int reclaim = candidate && (pageout_mode == 1 ||
+                       (pageout_mode == 2 && fb_pageout_pressured(&total_kb, &avail_kb, &psi_some10)));
+        if (candidate && pageout_mode == 2) {
+            static _Atomic int pressure_logs;
+            if (atomic_fetch_add(&pressure_logs, 1) < 16)
+                VLOG("file-backed pools: PAGEOUT pressure gate %s for %.1f MiB texture pool: MemAvailable %.1f MiB, MemTotal %.1f MiB, PSI some avg10 %.1f %% (requires <= max(512 MiB, MemTotal/8) and >= 5%% PSI; missing metrics skip)",
+                     reclaim ? "allow" : "skip", size / 1048576.0,
+                     avail_kb / 1024.0, total_kb / 1024.0, psi_some10);
+        }
         int sr = sync_file_range(g_fb_fd, off, (off64_t)size,
                                  SYNC_FILE_RANGE_WRITE | (reclaim ? SYNC_FILE_RANGE_WAIT_AFTER : 0));
         if (reclaim) {
