@@ -1657,6 +1657,7 @@ void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) {   // hle_n
         g_fbs.pools++; g_fbs.moved += copied; atomic_store(&g_fb_n, g_fb.n);
         nlog = g_fbs.pools <= 8 || !(g_fbs.pools & 63);
         if (kind == 2 && VKA_ENV("DM_MEM_FILEBACK_RECLAIM", 0) && vkfr_candidate(size, copied)) {
+            if (g_nfbr == FBRC_MAX) fbr_prune_locked(); // scene transitions may leave stale historical candidates
             if (g_nfbr < FBRC_MAX) {
                 g_fbr[g_nfbr++] = (fbr_cand){.lo=lo, .hi=hi, .off=(uint64_t)off, .born=mono_ns()};
                 candidate_added = 1;
