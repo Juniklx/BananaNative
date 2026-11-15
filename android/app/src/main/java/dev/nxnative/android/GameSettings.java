@@ -154,6 +154,11 @@ final class GameSettings {
             if (GameUpscaler.mode(a, id) == GameUpscaler.MODE_FSR)   // only with FSR 1 chosen
                 picture.add(new Ui.Setting(a, "✨", "FSR sharpness", v -> sharpness(a, g, again)).value(dflt(GameUpscaler.ownSharp(a, id), GameUpscaler.sharpName(a, id))).chevron(a).sub());
         }
+        if (TextureQuality.supports(id))
+            picture.add(new Ui.Setting(a, "🧩", "Texture quality (experimental)", v -> textureQuality(a, g, again))
+                    .value(TextureQuality.NAMES[Prefs.textureQuality(a, id)])
+                    .note("Eligible packaged block-compressed textures only; the game's pools are unchanged. Restart to apply.")
+                    .chevron(a));
         picture.add(new Ui.Setting(a, "📺", "Display", v -> display(a, g, again)).value(Prefs.DISPLAY_NAMES[Prefs.stretch(a, id) ? 1 : 0]).chevron(a));
         if (!aspects(prof).isEmpty())   // a profile with a native aspect mod (game.tsv variant rows labelled w:h)
             picture.add(new Ui.Setting(a, "🔳", "Aspect ratio", v -> aspect(a, g, again)).value(aspectLabel(a, id)).chevron(a));
@@ -704,6 +709,16 @@ final class GameSettings {
             x.dismiss();
             done.run();
         }).setNegativeButton("Cancel", null).show();
+    }
+
+    private static void textureQuality(MainActivity a, Game g, Runnable done) {
+        new AlertDialog.Builder(a).setTitle("Texture quality · " + g.name)
+                .setMessage("Experimental: only large block-compressed textures with mipmaps from the game's files. Render targets and original texture pools are not reduced. Restart to apply.")
+                .setSingleChoiceItems(TextureQuality.NAMES, Prefs.textureQuality(a, g.titleId), (d, w) -> {
+                    Prefs.textureQuality(a, g.titleId, w);
+                    d.dismiss();
+                    done.run();
+                }).setNegativeButton("Cancel", null).show();
     }
 
     private static void env(MainActivity a, Game g, Runnable done) {
