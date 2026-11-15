@@ -1622,10 +1622,11 @@ static void img_evict_locked(vka_img *im) {
 // The texture cache's limit (vka_texlimit.h): measured from the device every 60 frames (15 under memory pressure), or DM_VK_IMG_LIMIT_MB. Images over it are evicted least recently
 // used first, never one used in this frame or the last; a working set larger than the limit stays (logged), as uploading it again every frame costs far more than the memory
 static uint64_t g_img_lim, g_lim_frame, g_prune_dry;
-static int g_psi_pressed;   // memory pressure past VKTL_PSI_HOLD at the last update: measured every 15 frames instead of 60
+static int g_mem_pressed;   // PSI or opt-in low-MemAvailable pressure: measured every 15 frames instead of 60
 static uint64_t meminfo_kb(const char *buf, const char *key) { const char *p = strstr(buf, key); return p ? strtoull(p + strlen(key), NULL, 10) : 0; }
-static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
-    if (g_img_lim && cur_frame < g_lim_frame + (g_psi_pressed ? 15 : 60)) return;
+static void img_limit_update(uint64_t cur_frame, int force) {   // caller holds g_tmu
+    // A large incoming texture may force one fresh memory reading per frame.
+    if (g_img_lim && cur_frame < g_lim_frame + (g_mem_pressed ? 15 : 60) && !(force && cur_frame > g_lim_frame)) return;
     g_lim_frame = cur_frame;
     uint64_t imgs = g_img_bytes + vka_imem_zbytes();
     int env = VKA_ENV("DM_VK_IMG_LIMIT_MB", 0);
@@ -1651,12 +1652,25 @@ static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
         }
     }
     uint64_t lim = env > 0 ? (uint64_t)env << 20 : vktl_limit(&in), old = g_img_lim;
-    int pressed = env <= 0 && in.psi_some10 >= VKTL_PSI_HOLD;
-    if (pressed != g_psi_pressed) {
+    // PSI can be unreadable on Android; respond to measured RAM headroom
+    // instead of waiting until lmkd kills the foreground game. Opt-in only.
+    int ram_low = env <= 0 && VKA_ENV("DM_VK_IMG_RAM_PRESSURE", 0) && vktl_ram_low(in.mem_total, in.mem_avail);
+    if (ram_low) lim = vktl_ram_pressure_limit(lim, imgs, in.mem_total, in.mem_avail);
+    int psi_pressed = env <= 0 && in.psi_some10 >= VKTL_PSI_HOLD;
+    int pressed = psi_pressed || ram_low;
+    if (pressed != g_mem_pressed) {
         static _Atomic int np;
-        if (atomic_fetch_add(&np, 1) < 32) VLOG("image cache: memory pressure %.1f %% (some avg10): %s, limit %llu MiB, images %.0f MiB", in.psi_some10 < 0 ? 0 : in.psi_some10,
-                                                 pressed ? (in.psi_some10 >= VKTL_PSI_SHRINK ? "shrinking" : "holding") : "eased, the RAM rule again", (unsigned long long)(lim >> 20), imgs / 1048576.0);
-        g_psi_pressed = pressed;
+        if (atomic_fetch_add(&np, 1) < 32) {
+            if (ram_low && !psi_pressed)
+                VLOG("image cache: RAM fallback %s: MemAvailable %.0f MiB below reserve %.0f MiB, limit %llu MiB, images %.0f MiB (only eligible completed images can be evicted)",
+                     pressed ? "active" : "inactive", in.mem_avail / 1048576.0, vktl_reserve(in.mem_total) / 1048576.0,
+                     (unsigned long long)(lim >> 20), imgs / 1048576.0);
+            else
+                VLOG("image cache: memory pressure %.1f %% (some avg10): %s, limit %llu MiB, images %.0f MiB", in.psi_some10 < 0 ? 0 : in.psi_some10,
+                     pressed ? (in.psi_some10 >= VKTL_PSI_SHRINK || ram_low ? "shrinking" : "holding") : "eased, the RAM rule again",
+                     (unsigned long long)(lim >> 20), imgs / 1048576.0);
+        }
+        g_mem_pressed = pressed;
     }
     g_img_lim = lim;
     uint64_t d = lim > old ? lim - old : old - lim;
@@ -1673,7 +1687,7 @@ static int prune_cmp(const void *a, const void *b) { const prune_ent *x = a, *y 
 static void vka_tex_prune_locked(uint64_t incoming) {
     uint64_t cur_frame = vka_frame();
     if (!cur_frame) return;
-    img_limit_update(cur_frame);
+    img_limit_update(cur_frame, incoming != 0 && VKA_ENV("DM_VK_IMG_RAM_PRESSURE", 0));
     uint64_t limit_bytes = g_img_lim, total_bytes = g_img_bytes + vka_imem_zbytes();
     if (!limit_bytes || vktl_projected(total_bytes, incoming) <= limit_bytes || (!incoming && g_prune_dry == cur_frame)) return;   // A new large allocation gets a fresh check even if the ordinary prune found nothing this frame
     static prune_ent *c; static int ccap; int nc = 0;

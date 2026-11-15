@@ -51,6 +51,20 @@ static inline uint64_t vktl_pressure_limit(uint64_t lim, uint64_t img_bytes, dou
     else if (psi_some10 >= VKTL_PSI_HOLD) { if (img_bytes < lim) lim = img_bytes; }
     return lim < VKTL_FLOOR ? VKTL_FLOOR : lim;
 }
+// Opt-in fallback on Android devices where /proc/pressure/memory is unreadable.
+// MemAvailable below the existing reserve is a strong enough warning to ask
+// the normal eviction path for up to one eighth of the image cache. This does
+// NOT bypass holds, unfinished fences, recent-frame protection or the 512 MiB
+// floor. It may free nothing if the working set is still in use.
+static inline int vktl_ram_low(uint64_t mem_total, uint64_t mem_avail) {
+    return mem_total && mem_avail && mem_avail < vktl_reserve(mem_total);
+}
+static inline uint64_t vktl_ram_pressure_limit(uint64_t lim, uint64_t img_bytes, uint64_t mem_total, uint64_t mem_avail) {
+    if (!vktl_ram_low(mem_total, mem_avail)) return lim;
+    uint64_t reduced = img_bytes - img_bytes / 8;
+    if (reduced < VKTL_FLOOR) reduced = VKTL_FLOOR;
+    return reduced < lim ? reduced : lim;
+}
 // The limit in bytes; floor when nothing is known
 static inline uint64_t vktl_limit(const vktl_in *in) {
     uint64_t lim = UINT64_MAX;

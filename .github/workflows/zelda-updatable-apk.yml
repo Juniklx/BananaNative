@@ -7,7 +7,7 @@ name: Zelda updatable APK
 
 on:
   push:
-    branches: [opt/zelda-continuous-updates]
+    branches: [opt/zelda-continuous-updates, opt/zelda-ram-pressure-reclaim]
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
@@ -44,6 +44,7 @@ jobs:
           "$RUNNER_TEMP/t_android_texlimit"
           grep -q '^DM_VK_SCRATCH_IDLE_MB[[:space:]]' docs/env_switches.tsv
           grep -q '^DM_VK_IMG_PREPRUNE[[:space:]]' docs/env_switches.tsv
+          grep -q '^DM_VK_IMG_RAM_PRESSURE[[:space:]]' docs/env_switches.tsv
 
       - name: Restore stable test signer from GitHub Actions cache
         id: signer
@@ -156,7 +157,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: zelda-updatable-APK-existing-pack-required
+          name: zelda-ram-pressure-test-APK-existing-pack-required
           path: |
             android/app/out/nxnative-android-zeldareclaim2.apk
             ${{ runner.temp }}/apk-sha256.txt
