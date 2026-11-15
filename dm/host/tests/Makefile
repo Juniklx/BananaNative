@@ -447,6 +447,14 @@ run: fileback
 endif
 $(B)/t_android_fileback: t_android_fileback.c $(VKA)/vka_fileback.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_fileback.c -lpthread
+# Pure deferred file-backed texture reclaim policy; safe to run on Linux/macOS
+# (the policy test itself does not call mmap, PAGEOUT or access guest memory).
+.PHONY: fileback-reclaim
+fileback-reclaim: $(B)/t_vka_fileback_reclaim
+	$(B)/t_vka_fileback_reclaim
+run: fileback-reclaim
+$(B)/t_vka_fileback_reclaim: t_vka_fileback_reclaim.c $(VKA)/vka_fileback_reclaim.h | $(B)
+	$(CLANG) -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -o $@ t_vka_fileback_reclaim.c
 # The game's barriers between compute dispatches: the barrier chosen for each, checked against NVN's ordering over every short sequence (vka_gbar.h; vka_gbar.c)
 $(B)/t_android_gbar: t_android_gbar.c $(VKA)/vka_gbar.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_gbar.c
