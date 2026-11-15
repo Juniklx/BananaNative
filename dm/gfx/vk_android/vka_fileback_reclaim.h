@@ -24,4 +24,12 @@ static inline int vkfr_due(uint64_t now_ns, uint64_t created_ns, uint64_t last_t
 static inline int vkfr_resident(uint64_t resident_bytes) {
     return resident_bytes >= VKFR_MIN_RESIDENT;
 }
+// A slice must still have the original file-offset identity; an address alone
+// is not enough after placement, finalization, or re-use of a guest memory range.
+static inline int vkfr_piece_covers(uintptr_t piece_lo, uintptr_t piece_hi, uint64_t piece_off,
+                                     uintptr_t slice_lo, uintptr_t slice_hi, uint64_t slice_off) {
+    if (piece_lo > slice_lo || piece_hi < slice_hi || slice_lo >= slice_hi) return 0;
+    uint64_t delta = (uint64_t)(slice_lo - piece_lo);
+    return piece_off <= UINT64_MAX - delta && piece_off + delta == slice_off;
+}
 #endif
