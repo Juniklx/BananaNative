@@ -1717,6 +1717,12 @@ static void vka_tex_prune_locked(uint64_t incoming) {
     img_limit_update(cur_frame);
     uint64_t limit_bytes = g_img_lim, total_bytes = g_img_bytes + vka_imem_zbytes();
     if (!limit_bytes || vktl_projected(total_bytes, incoming) <= limit_bytes || (!incoming && g_prune_dry == cur_frame)) return;   // A new large allocation gets a fresh check even if the ordinary prune found nothing this frame
+    int budget_setting = VKA_ENV("DM_VK_PRUNE_MS", 0);
+    uint32_t budget_ms = budget_setting > 30 ? 30 : budget_setting > 0 ? (uint32_t)budget_setting : 0;
+    int critical_ram = g_img_ram_guard > 0 || !g_img_ram_known;
+    // Skip sorting and scanning too if this frame already spent its routine
+    // eviction allowance. Never skip pre-allocation or critical-RAM cleanup.
+    if (vktl_prune_time_hit(g_prune_budget_used_ns, budget_ms, critical_ram, incoming)) return;
     static prune_ent *c; static int ccap; int nc = 0;
     if (ccap < g_nlive) { ccap = g_nlive + 256; c = realloc(c, (size_t)ccap * sizeof *c); }
     uint64_t done_fence = vka_done(); int video = dm_movie_playing();
@@ -1806,16 +1812,9 @@ static void vka_tex_prune_locked(uint64_t incoming) {
         }
     }
     qsort(c, (size_t)nc, sizeof *c, prune_cmp);
-    // Budget only routine pruning, not the forecast before a large Vulkan
-    // allocation, and never when available RAM is below the reserve.
-    int budget_setting = VKA_ENV("DM_VK_PRUNE_MS", 0);
-    uint32_t budget_ms = budget_setting > 30 ? 30 : budget_setting > 0 ? (uint32_t)budget_setting : 0;
-    int critical_ram = g_img_ram_guard > 0 || !g_img_ram_known;
     // The budget spans *all* routine prune calls in a frame; texture creation
     // can call this many times before a present. Large incoming allocations
     // and low-RAM cleanup intentionally ignore the ordinary-frame budget.
-    if (vktl_prune_time_hit(g_prune_budget_used_ns, budget_ms, critical_ram, incoming))
-        return;
     uint64_t started = budget_ms && !critical_ram && !incoming ? image_prune_now_ns() : 0;
     int budget_hit = 0;
     uint64_t target = vktl_target(limit_bytes), bytes_freed = 0; int pruned = 0;
@@ -1827,7 +1826,7 @@ static void vka_tex_prune_locked(uint64_t incoming) {
         if (started) {
             uint64_t now = image_prune_now_ns();
             uint64_t elapsed = now >= started ? now - started : 0;
-            if (vktl_prune_time_hit(g_prune_budget_used_ns + elapsed, budget_ms, critical_ram, incoming)) {
+            if (vktl_prune_time_hit(vktl_projected(g_prune_budget_used_ns, elapsed), budget_ms, critical_ram, incoming)) {
                 budget_hit = 1;
                 break;
             }
