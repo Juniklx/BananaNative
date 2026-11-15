@@ -72,6 +72,56 @@ static inline int vktl_evictable(uint64_t cur_frame, uint64_t last_frame, int ho
     if (holds || video_playing || fence_pending || !last_frame || cur_frame <= last_frame) return 0;
     return cur_frame - last_frame >= (uint64_t)(gpu_owned ? VKTL_GPU_FRAMES : VKTL_KEEP_FRAMES);
 }
+// Optional Android fallback when PSI is unavailable or reports no pressure.
+// A measured MemAvailable below the device's reserve is a pressure signal,
+// not proof of lmkd's decision. Unknown inputs fail closed (no extra shrink).
+static inline int vktl_ram_pressure(uint64_t total, uint64_t avail) {
+    if (!total || !avail) return 0;
+    uint64_t reserve = vktl_reserve(total);
+    if (avail <= reserve) return 2;              // shrink
+    if (avail - reserve <= reserve / 4) return 1; // hold growth
+    return 0;
+}
+// Keep the recently used texture set longer only while sufficient RAM exists;
+// during memory pressure restore the original 2-frame grace. The GPU-only
+// content grace and submitted/unsent fence protections are unchanged.
+static inline uint32_t vktl_adaptive_keep(int requested, uint64_t total, uint64_t avail, double psi) {
+    if (requested < VKTL_KEEP_FRAMES) return VKTL_KEEP_FRAMES;
+    uint32_t want = requested > 8 ? 8u : (uint32_t)requested;
+    if (!total || !avail || psi >= VKTL_PSI_HOLD) return VKTL_KEEP_FRAMES;
+    uint64_t reserve = vktl_reserve(total);
+    if (avail <= reserve || avail - reserve <= reserve / 4) return VKTL_KEEP_FRAMES;
+    if (avail - reserve <= reserve) return want < 4 ? want : 4;
+    return want;
+}
+// A low-MemAvailable fallback is *opt-in*, applied only to the Zelda launcher.
+// Shrink by at most one eighth of image storage per observation. It cannot
+// lower the 512 MiB texture-cache floor and never frees images still in use.
+static inline uint64_t vktl_android_fallback_limit(uint64_t base, uint64_t imgs,
+                                                    uint64_t total, uint64_t avail, double psi) {
+    if (psi >= VKTL_PSI_HOLD) return base; // normal PSI policy already applies
+    int p = vktl_ram_pressure(total, avail);
+    if (!p) return base;
+    uint64_t cap = p == 2 ? vktl_sub(imgs, imgs / 8) : imgs;
+    if (cap < VKTL_FLOOR) cap = VKTL_FLOOR;
+    return cap < base ? cap : base;
+}
+// Budget only background/current-frame pruning, never the pre-allocation
+// pass and never when observed RAM is low. A per-frame time budget may defer
+// eviction but cannot waive Vulkan resource-lifetime protections.
+static inline int vktl_prune_time_hit(uint64_t elapsed_ns, uint32_t budget_ms,
+                                      int critical_ram, uint64_t incoming) {
+    return budget_ms && !critical_ram && !incoming &&
+           elapsed_ns >= (uint64_t)budget_ms * 1000000ull;
+}
+static inline int vktl_evictable_keep(uint64_t cur_frame, uint64_t last_frame, int holds,
+                                      int gpu_owned, int video_playing, int fence_pending,
+                                      uint32_t keep_frames) {
+    if (holds || video_playing || fence_pending || !last_frame || cur_frame <= last_frame) return 0;
+    uint64_t keep = gpu_owned ? VKTL_GPU_FRAMES :
+                    keep_frames >= VKTL_KEEP_FRAMES ? keep_frames : VKTL_KEEP_FRAMES;
+    return cur_frame - last_frame >= keep;
+}
 // Eviction order: images that can be uploaded again before GPU-only ones, then least recently used first (qsort-style: < 0 = a goes first)
 static inline int vktl_order(int gpu_a, uint64_t last_a, int gpu_b, uint64_t last_b) {
     if (gpu_a != gpu_b) return gpu_a - gpu_b;

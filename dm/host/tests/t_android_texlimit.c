@@ -80,6 +80,55 @@ int main(void) {
     CHECK(!vktl_evictable(100, 0, 0, 0, 0, 0), "never stamped: kept");
     CHECK(!vktl_evictable(100, 50, 0, 1, 0, 0) && vktl_evictable(200, 50, 0, 1, 0, 0), "GPU content: only after VKTL_GPU_FRAMES");
     CHECK(vktl_order(0, 90, 1, 10) < 0 && vktl_order(0, 10, 0, 90) < 0 && vktl_order(1, 10, 1, 90) < 0, "uploadable before GPU-only, oldest first");
+    // Zelda Galaxy S24 FE: /proc/pressure/memory can be denied, while
+    // MemAvailable falls below the 903 MiB reserve and Android LMKD kills it.
+    // The opt-in fallback must shrink texture cache conservatively and
+    // disable extended recent-frame retention before RAM is exhausted.
+    const uint64_t s24_total = 7224 * MIB, s24_res = vktl_reserve(s24_total);
+    CHECK(s24_res == 903 * MIB, "7.1 GiB RAM, 1/8 reserve is 903 MiB");
+    CHECK(vktl_ram_pressure(s24_total, 740 * MIB) == 2, "low 740 MiB triggers fallback shrink");
+    CHECK(vktl_ram_pressure(s24_total, s24_res + 200 * MIB) == 1, "near reserve holds cache growth");
+    CHECK(vktl_ram_pressure(s24_total, 1800 * MIB) == 0, "ample memory does not limit cache");
+    CHECK(vktl_ram_pressure(0, 740 * MIB) == 0 && vktl_ram_pressure(s24_total, 0) == 0,
+          "unknown data cannot trigger reclaim");
+    CHECK(vktl_android_fallback_limit(950 * MIB, 1024 * MIB, s24_total, 740 * MIB, -1) == 896 * MIB,
+          "missing PSI plus low RAM shrinks 1/8 of image storage");
+    CHECK(vktl_android_fallback_limit(1200 * MIB, 1024 * MIB, s24_total, s24_res+200*MIB, -1) == 1024 * MIB,
+          "near reserve holds the existing image count");
+    CHECK(vktl_android_fallback_limit(950 * MIB, 1024 * MIB, 0, 740 * MIB, -1) == 950 * MIB,
+          "unknown MemTotal does not shrink");
+    CHECK(vktl_android_fallback_limit(950 * MIB, 1024 * MIB, s24_total, 740 * MIB, 5.0) == 950 * MIB,
+          "PSI-based policy already takes precedence");
+    CHECK(vktl_android_fallback_limit(600 * MIB, 512 * MIB, s24_total, 632 * MIB, -1) == VKTL_FLOOR,
+          "512 MiB floor never bypassed");
+    CHECK(vktl_adaptive_keep(8, s24_total, 3000*MIB, -1) == 8,
+          "eight-frame grace only with enough available RAM");
+    CHECK(vktl_adaptive_keep(8, s24_total, 1600*MIB, -1) == 4,
+          "moderate RAM leaves four-frame grace");
+    CHECK(vktl_adaptive_keep(8, s24_total, 740*MIB, -1) == 2,
+          "low memory restores original two-frame grace");
+    CHECK(vktl_adaptive_keep(8, s24_total, 3000*MIB, 5.0) == 2,
+          "measured PSI also restores two frames");
+    CHECK(vktl_adaptive_keep(8, 0, 3000*MIB, -1) == 2,
+          "missing metrics never make texture-cache retention aggressive");
+    CHECK(vktl_adaptive_keep(4, s24_total, 3000*MIB, -1) == 4 &&
+          vktl_adaptive_keep(99, s24_total, 3000*MIB, -1) == 8,
+          "user choice is respected and clamped to eight frames");
+    CHECK(!vktl_evictable_keep(100, 94, 0, 0, 0, 0, 8) &&
+          vktl_evictable_keep(100, 92, 0, 0, 0, 0, 8),
+          "recently used images stay for eight frames only at high headroom");
+    CHECK(vktl_evictable_keep(100, 98, 0, 0, 0, 0, 2),
+          "original two-frame eviction is preserved under pressure");
+    CHECK(!vktl_evictable_keep(100, 10, 1, 0, 0, 0, 2) &&
+          !vktl_evictable_keep(100, 10, 0, 0, 0, 1, 2),
+          "holders and pending GPU fences never become evictable");
+    CHECK(!vktl_evictable_keep(100, 50, 0, 1, 0, 0, 2),
+          "GPU-produced images keep the original 120-frame grace");
+    CHECK(!vktl_prune_time_hit(6000000, 4, 1, 0) &&
+          !vktl_prune_time_hit(6000000, 4, 0, 64 * MIB) &&
+          vktl_prune_time_hit(6000000, 4, 0, 0) &&
+          !vktl_prune_time_hit(6000000, 0, 0, 0),
+          "time budget is bypassed on pressure or preallocation");
 
     // Forecast a large Zelda depth image before allocation, without integer overflow.
     CHECK(vktl_projected(409 * MIB, 288 * MIB) == 697 * MIB, "large image forecast before allocating");

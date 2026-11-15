@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <time.h>
 #include "vka_zshare.h"
 #include "vka_gml.h"
 #include "vka_texlimit.h"
@@ -1621,12 +1622,27 @@ static void img_evict_locked(vka_img *im) {
 }
 // The texture cache's limit (vka_texlimit.h): measured from the device every 60 frames (15 under memory pressure), or DM_VK_IMG_LIMIT_MB. Images over it are evicted least recently
 // used first, never one used in this frame or the last; a working set larger than the limit stays (logged), as uploading it again every frame costs far more than the memory
-static uint64_t g_img_lim, g_lim_frame, g_prune_dry;
+static uint64_t g_img_lim, g_lim_frame, g_prune_dry, g_lim_monotonic_ns;
+static uint32_t g_img_keep_frames = VKTL_KEEP_FRAMES;
+static int g_img_ram_guard, g_img_ram_known;
+static uint64_t g_prune_budget_frame, g_prune_budget_used_ns;  // g_tmu: one frame, across all routine prune calls
 static int g_psi_pressed;   // memory pressure past VKTL_PSI_HOLD at the last update: measured every 15 frames instead of 60
 static uint64_t meminfo_kb(const char *buf, const char *key) { const char *p = strstr(buf, key); return p ? strtoull(p + strlen(key), NULL, 10) : 0; }
+static uint64_t image_prune_now_ns(void) {
+    struct timespec ts;
+    return clock_gettime(CLOCK_MONOTONIC, &ts) ? 0 :
+           (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
 static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
-    if (g_img_lim && cur_frame < g_lim_frame + (g_psi_pressed ? 15 : 60)) return;
+    int ram_guard = VKA_ENV("DM_VK_IMG_RAM_PRESSURE", 0);
+    uint64_t now = ram_guard ? image_prune_now_ns() : 0;
+    // Zelda: sample RAM by elapsed time too. At 0.4 fps, 60 frames can be
+    // minutes; it cannot react to lmkd pressure fast enough on this phone.
+    if (g_img_lim && cur_frame < g_lim_frame + (g_psi_pressed ? 15 : 60) &&
+        (!ram_guard || (now && g_lim_monotonic_ns && now >= g_lim_monotonic_ns &&
+                        now - g_lim_monotonic_ns < 2000000000ull))) return;
     g_lim_frame = cur_frame;
+    g_lim_monotonic_ns = now;
     uint64_t imgs = g_img_bytes + vka_imem_zbytes();
     int env = VKA_ENV("DM_VK_IMG_LIMIT_MB", 0);
     vktl_in in = {.img_bytes = imgs, .psi_some10 = -1};
@@ -1651,6 +1667,20 @@ static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
         }
     }
     uint64_t lim = env > 0 ? (uint64_t)env << 20 : vktl_limit(&in), old = g_img_lim;
+    uint32_t old_keep = g_img_keep_frames;
+    g_img_keep_frames = vktl_adaptive_keep(VKA_ENV("DM_VK_IMG_KEEP_FRAMES", VKTL_KEEP_FRAMES),
+                                            in.mem_total, in.mem_avail, in.psi_some10);
+    g_img_ram_known = in.mem_total && in.mem_avail;
+    g_img_ram_guard = env <= 0 && ram_guard ? vktl_ram_pressure(in.mem_total, in.mem_avail) : 0;
+    if (g_img_ram_guard)
+        lim = vktl_android_fallback_limit(lim, imgs, in.mem_total, in.mem_avail, in.psi_some10);
+    if (g_img_keep_frames != old_keep) {
+        static _Atomic int nk;
+        if (atomic_fetch_add(&nk, 1) < 20)
+            VLOG("image cache adaptive grace: %u -> %u frames (MemAvailable %.0f MiB, reserve %.0f MiB; RAM guard %d, PSI %.1f)",
+                 old_keep, g_img_keep_frames, in.mem_avail / 1048576.0,
+                 vktl_reserve(in.mem_total) / 1048576.0, g_img_ram_guard, in.psi_some10);
+    }
     int pressed = env <= 0 && in.psi_some10 >= VKTL_PSI_HOLD;
     if (pressed != g_psi_pressed) {
         static _Atomic int np;
@@ -1659,6 +1689,13 @@ static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
         g_psi_pressed = pressed;
     }
     g_img_lim = lim;
+    static int old_guard;
+    if (g_img_ram_guard != old_guard) {
+        VLOG("image cache RAM guard %d -> %d: MemAvailable %.0f MiB, reserve %.0f MiB, image limit %.0f MiB (PSI %.1f%%; DM_VK_IMG_RAM_PRESSURE)",
+             old_guard, g_img_ram_guard, in.mem_avail / 1048576.0,
+             vktl_reserve(in.mem_total) / 1048576.0, lim / 1048576.0, in.psi_some10);
+        old_guard = g_img_ram_guard;
+    }
     uint64_t d = lim > old ? lim - old : old - lim;
     static _Atomic int nl;
     if ((!old || d >= 512 * VKTL_MIB) && atomic_fetch_add(&nl, 1) < 16) {
@@ -1673,9 +1710,19 @@ static int prune_cmp(const void *a, const void *b) { const prune_ent *x = a, *y 
 static void vka_tex_prune_locked(uint64_t incoming) {
     uint64_t cur_frame = vka_frame();
     if (!cur_frame) return;
+    if (g_prune_budget_frame != cur_frame) {
+        g_prune_budget_frame = cur_frame;
+        g_prune_budget_used_ns = 0;
+    }
     img_limit_update(cur_frame);
     uint64_t limit_bytes = g_img_lim, total_bytes = g_img_bytes + vka_imem_zbytes();
     if (!limit_bytes || vktl_projected(total_bytes, incoming) <= limit_bytes || (!incoming && g_prune_dry == cur_frame)) return;   // A new large allocation gets a fresh check even if the ordinary prune found nothing this frame
+    int budget_setting = VKA_ENV("DM_VK_PRUNE_MS", 0);
+    uint32_t budget_ms = budget_setting > 30 ? 30 : budget_setting > 0 ? (uint32_t)budget_setting : 0;
+    int critical_ram = g_img_ram_guard > 0 || !g_img_ram_known;
+    // Skip sorting and scanning too if this frame already spent its routine
+    // eviction allowance. Never skip pre-allocation or critical-RAM cleanup.
+    if (vktl_prune_time_hit(g_prune_budget_used_ns, budget_ms, critical_ram, incoming)) return;
     static prune_ent *c; static int ccap; int nc = 0;
     if (ccap < g_nlive) { ccap = g_nlive + 256; c = realloc(c, (size_t)ccap * sizeof *c); }
     uint64_t done_fence = vka_done(); int video = dm_movie_playing();
@@ -1712,7 +1759,7 @@ static void vka_tex_prune_locked(uint64_t incoming) {
             continue;
         }
         int pending = im->last_fence && done_fence < im->last_fence;
-        if (vktl_evictable(cur_frame, im->last_frame, im->holds, im->gpu_owned, im->is_video && video, pending)) {
+        if (vktl_evictable_keep(cur_frame, im->last_frame, im->holds, im->gpu_owned, im->is_video && video, pending, g_img_keep_frames)) {
             c[nc++] = (prune_ent){im, im->last_frame, im->gpu_owned != 0};
             if (diag) diag_bytes[0] += im->bytes;
         } else if (diag) {
@@ -1765,12 +1812,39 @@ static void vka_tex_prune_locked(uint64_t incoming) {
         }
     }
     qsort(c, (size_t)nc, sizeof *c, prune_cmp);
+    // The budget spans *all* routine prune calls in a frame; texture creation
+    // can call this many times before a present. Large incoming allocations
+    // and low-RAM cleanup intentionally ignore the ordinary-frame budget.
+    uint64_t started = budget_ms && !critical_ram && !incoming ? image_prune_now_ns() : 0;
+    int budget_hit = 0;
     uint64_t target = vktl_target(limit_bytes), bytes_freed = 0; int pruned = 0;
     for (int k = 0; k < nc && vktl_projected(total_bytes, incoming) > target; k++) {
         uint64_t before = g_img_bytes + vka_imem_zbytes();
         img_evict_locked(c[k].im);
         uint64_t after = g_img_bytes + vka_imem_zbytes(), b = before > after ? before - after : 0;
         pruned++; bytes_freed += b; total_bytes = after;
+        if (started) {
+            uint64_t now = image_prune_now_ns();
+            uint64_t elapsed = now >= started ? now - started : 0;
+            if (vktl_prune_time_hit(vktl_projected(g_prune_budget_used_ns, elapsed), budget_ms, critical_ram, incoming)) {
+                budget_hit = 1;
+                break;
+            }
+        }
+    }
+    if (started) {
+        uint64_t end = image_prune_now_ns();
+        if (end >= started) {
+            uint64_t delta = end - started;
+            g_prune_budget_used_ns = delta > UINT64_MAX - g_prune_budget_used_ns ?
+                                     UINT64_MAX : g_prune_budget_used_ns + delta;
+        }
+    }
+    if (budget_hit) {
+        static _Atomic int nb;
+        if (atomic_fetch_add(&nb, 1) < 24)
+            VLOG("image cache prune budget: %u ms elapsed after %d evictions, %.1f MiB freed; remaining %.1f MiB, target %.1f MiB (continuing next frame, bypassed on low RAM / large incoming)",
+                 budget_ms, pruned, bytes_freed / 1048576.0, total_bytes / 1048576.0, target / 1048576.0);
     }
     if (pruned) {
         static _Atomic int n;
@@ -1778,7 +1852,7 @@ static void vka_tex_prune_locked(uint64_t incoming) {
             VLOG("image cache pruned: evicted %d images unused for %llu+ frames (%.1f MiB freed, %d live remaining, %.1f MiB, limit %.0f MiB)",
                  pruned, (unsigned long long)(cur_frame - c[pruned - 1].last), bytes_freed / 1048576.0, g_nlive, total_bytes / 1048576.0, limit_bytes / 1048576.0);
     }
-    if (vktl_projected(total_bytes, incoming) > limit_bytes) {   // The protected working set remains over the projected budget
+    if (!budget_hit && vktl_projected(total_bytes, incoming) > limit_bytes) {   // Protected working set remains over the projected budget
         g_prune_dry = cur_frame;
         static uint64_t logged; static _Atomic int n;
         uint64_t projected = vktl_projected(total_bytes, incoming);
@@ -1788,8 +1862,8 @@ static void vka_tex_prune_locked(uint64_t incoming) {
                 VLOG("image cache pre-allocation: %.0f MiB currently, next texture storage %.0f MiB (Vulkan size may differ), projected %.0f MiB, limit %.0f MiB; protected images stay",
                      total_bytes / 1048576.0, incoming / 1048576.0, projected / 1048576.0, limit_bytes / 1048576.0);
             else
-                VLOG("image cache over its limit: %.0f MiB of images, limit %.0f MiB; the rest was used in the last %d frames, is held or is named by a texture pool slot (%d images), so it stays (evicting it would upload it again)",
-                     total_bytes / 1048576.0, limit_bytes / 1048576.0, VKTL_KEEP_FRAMES, npool);
+                VLOG("image cache over its limit: %.0f MiB of images, limit %.0f MiB; the rest was used in the last %u frames, is held or is named by a texture pool slot (%d images), so it stays (evicting it would upload it again)",
+                     total_bytes / 1048576.0, limit_bytes / 1048576.0, g_img_keep_frames, npool);
         }
     }
 }
