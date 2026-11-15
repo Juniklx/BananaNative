@@ -455,6 +455,13 @@ fileback-reclaim: $(B)/t_vka_fileback_reclaim
 run: fileback-reclaim
 $(B)/t_vka_fileback_reclaim: t_vka_fileback_reclaim.c $(VKA)/vka_fileback_reclaim.h | $(B)
 	$(CLANG) -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -o $@ t_vka_fileback_reclaim.c
+# Synthetic smaps parsing with no live process introspection.
+.PHONY: swapmap-diag
+swapmap-diag: $(B)/t_vka_swapmap_diag
+	$(B)/t_vka_swapmap_diag
+run: swapmap-diag
+$(B)/t_vka_swapmap_diag: t_vka_swapmap_diag.c $(VKA)/vka_swapmap_diag.h | $(B)
+	$(CLANG) -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -o $@ t_vka_swapmap_diag.c
 # The game's barriers between compute dispatches: the barrier chosen for each, checked against NVN's ordering over every short sequence (vka_gbar.h; vka_gbar.c)
 $(B)/t_android_gbar: t_android_gbar.c $(VKA)/vka_gbar.h | $(B)
 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_android_gbar.c

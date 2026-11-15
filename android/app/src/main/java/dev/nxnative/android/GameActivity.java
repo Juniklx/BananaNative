@@ -459,6 +459,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         if (TextureQuality.supports(id)) {
             env.add("DM_VK_STAGING_PRESSURE=1");   // Zelda-only pressure-aware GPU staging
             env.add("DM_MEM_FILEBACK_RECLAIM=1"); // Deferred, reversible PAGEOUT of file-backed textures under sustained low RAM
+            env.add("DM_VK_SWAPMAP_DIAG=1");     // One bounded SwapPss attribution snapshot on sustained RAM pressure
             env.add("DM_VK_IMG_RAM_PRESSURE=1"); // PSI-denied Android fallback for texture-cache pressure
             env.add("DM_VK_IMG_KEEP_FRAMES=8");  // Up to 8 frames with ample RAM; automatically 4/2 under memory pressure
             env.add("DM_VK_PRUNE_MS=4");         // Bounded routine image evictions; bypass under low RAM and for large new textures
