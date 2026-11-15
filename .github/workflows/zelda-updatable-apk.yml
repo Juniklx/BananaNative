@@ -39,6 +39,9 @@ jobs:
           cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
             -o "$RUNNER_TEMP/t_vka_scratch_policy" dm/host/tests/t_vka_scratch_policy.c
           "$RUNNER_TEMP/t_vka_scratch_policy"
+          cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
+            -o "$RUNNER_TEMP/t_vka_staging_pressure" dm/host/tests/t_vka_staging_pressure.c
+          "$RUNNER_TEMP/t_vka_staging_pressure"
           cc -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined \
             -o "$RUNNER_TEMP/t_android_texlimit" dm/host/tests/t_android_texlimit.c
           "$RUNNER_TEMP/t_android_texlimit"
