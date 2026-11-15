@@ -70,6 +70,24 @@ int main(void) {
     CHECK(vktl_limit(&p5) == 2 * GIB, "less available than the reserve: the RAM rule holds the images where they are, it never takes any back (%llu MiB)", (unsigned long long)(vktl_limit(&p5) >> 20));
     p5.psi_some10 = VKTL_PSI_SHRINK; CHECK(vktl_limit(&p5) == 2 * GIB - 2 * GIB / 8, "only pressure takes images back");
 
+    // Optional low-RAM fallback: on Android PSI may be unavailable, while
+    // MemAvailable still signals that the system has fallen below its reserve.
+    // This only lowers a budget; the normal fence/hold/age eviction tests remain.
+    CHECK(vktl_reserve(7 * GIB) == 896 * MIB, "7 GiB phone: one-eighth reserve");
+    CHECK(vktl_ram_low(7 * GIB, 730 * MIB), "730 MiB available: below the 896 MiB reserve");
+    CHECK(!vktl_ram_low(7 * GIB, 1024 * MIB), "enough available RAM: no fallback");
+    CHECK(!vktl_ram_low(7 * GIB, 0) && !vktl_ram_low(0, 730 * MIB), "unreadable metrics: no fallback");
+    CHECK(vktl_ram_pressure_limit(900 * MIB, 864 * MIB, 7 * GIB, 730 * MIB) == 756 * MIB,
+          "low RAM: request one-eighth of eligible image bytes back");
+    CHECK(vktl_ram_pressure_limit(700 * MIB, 864 * MIB, 7 * GIB, 730 * MIB) == 700 * MIB,
+          "never increase an already smaller cache limit");
+    CHECK(vktl_ram_pressure_limit(900 * MIB, 300 * MIB, 7 * GIB, 730 * MIB) == VKTL_FLOOR,
+          "even under memory pressure the 512 MiB image cache floor holds");
+    CHECK(vktl_ram_pressure_limit(900 * MIB, 864 * MIB, 7 * GIB, 1024 * MIB) == 900 * MIB,
+          "outside pressure preserve the original limit");
+    CHECK(vktl_ram_pressure_limit(900 * MIB, 864 * MIB, 0, 730 * MIB) == 900 * MIB,
+          "missing total RAM preserves the original limit");
+
     // candidates
     CHECK(!vktl_evictable(100, 100, 0, 0, 0, 0), "used this frame: kept");
     CHECK(!vktl_evictable(100, 99, 0, 0, 0, 0), "used the previous frame: kept");
