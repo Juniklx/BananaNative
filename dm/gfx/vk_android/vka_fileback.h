@@ -66,7 +66,7 @@ static inline int vkfb_punch(int fd, uint64_t off, uint64_t n) { return fallocat
 // it never changes pool bytes, mapping permissions or Vulkan lifetimes.
 static inline int vkfb_pageout_policy(int mode, uint64_t total_kb, uint64_t avail_kb, double psi_some10) {
     if (mode == 1) return 1;
-    if (mode != 2 || !total_kb || !avail_kb || psi_some10 < 5.0) return 0;
+    if (mode != 2 || !total_kb || !avail_kb || !(psi_some10 >= 5.0)) return 0;
     uint64_t reserve_kb = total_kb / 8;
     if (reserve_kb < 512ull * 1024) reserve_kb = 512ull * 1024;
     return avail_kb <= reserve_kb;
