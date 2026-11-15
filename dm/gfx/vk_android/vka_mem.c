@@ -39,6 +39,7 @@
 #include "vka_fd_alias.h"
 #include "vka_fileback.h"
 #include "vka_fileback_reclaim.h"
+#include "vka_swapmap_diag.h"
 
 static void fb_placed(uintptr_t lo, uintptr_t hi);           // File-backed pools (below): a placement took [lo, hi) from the file
 static void fb_gone(uintptr_t lo, uintptr_t hi, int back);   // a pool's range finalized (back 1: its pieces go back to anonymous memory) or released (0: dropped)
@@ -1461,10 +1462,11 @@ int dm_gfx_fileback_line(char *b, size_t n) {   // hle_nvn.c shp_report: the tot
 // texture pool is copied into a file; a page range is checked again under
 // both locks before the advisory call. Never frees guest or Vulkan memory.
 enum { FBRC_MAX = 64 };
-#define FBRC_CHUNK (128ull * VKFR_MIB)
+#define FBRC_CHUNK VKFR_SLICE_BYTES
 typedef struct { uintptr_t lo, hi; uint64_t off, born, last, cursor; } fbr_cand;
-static fbr_cand g_fbr[FBRC_MAX];  // guarded by g_fbmu
+static fbr_cand g_fbr[FBRC_MAX]; // guarded by g_fbmu
 static int g_nfbr;
+static unsigned g_fbr_next; // round-robin starting pool; guarded by g_fbmu
 static pthread_once_t g_fbr_once = PTHREAD_ONCE_INIT;
 static int fbr_meminfo(uint64_t *total, uint64_t *avail) {
     *total = *avail = 0;
@@ -1479,17 +1481,101 @@ static int fbr_meminfo(uint64_t *total, uint64_t *avail) {
     fclose(f);
     return *total && *avail;
 }
-static int fbr_piece_live(uintptr_t lo, uintptr_t hi, uint64_t off) {
-    // Caller holds g_fbmu. Partial placements may split the original pool.
+// The candidate remains usable if at least one piece of its original file
+// mapping still exists. A changed file offset cannot alias an older record.
+static int fbr_candidate_live(const fbr_cand *c) {
     for (int i = 0; i < g_fb.n; i++) {
         const vkfb_piece *p = &g_fb.p[i];
-        if (vkfr_piece_covers(p->lo, p->hi, p->off, lo, hi, off)) return 1;
+        if (vkfr_piece_covers(c->lo, c->hi, c->off, p->lo, p->hi, p->off)) return 1;
     }
     return 0;
+}
+// Caller holds g_fbmu. Purge candidates whose whole mapping was finalized
+// or moved into placed GPU memory; otherwise 64 historical pools would exhaust
+// the candidate table after scene changes.
+static void fbr_prune_locked(void) {
+    for (int i = 0; i < g_nfbr;) {
+        if (!fbr_candidate_live(&g_fbr[i])) g_fbr[i] = g_fbr[--g_nfbr];
+        else i++;
+    }
+    g_fbr_next = g_nfbr ? g_fbr_next % (unsigned)g_nfbr : 0;
+}
+// Within a round-robin 64 MiB window, select the largest uninterrupted
+// surviving file-backed subrange. A placement can split a candidate pool;
+// never advise the placed pages or rely on the old address alone.
+static int fbr_slice_locked(const fbr_cand *c, uintptr_t lo, uintptr_t hi,
+                            uintptr_t *slice_lo, uintptr_t *slice_hi, uint64_t *slice_off) {
+    size_t best = 0;
+    for (int i = 0; i < g_fb.n; i++) {
+        const vkfb_piece *p = &g_fb.p[i];
+        if (!vkfr_piece_covers(c->lo, c->hi, c->off, p->lo, p->hi, p->off)) continue;
+        uintptr_t a = lo > p->lo ? lo : p->lo;
+        uintptr_t e = hi < p->hi ? hi : p->hi;
+        if (e <= a || p->off > UINT64_MAX - (uint64_t)(a - p->lo)) continue;
+        if ((size_t)(e - a) > best) {
+            best = (size_t)(e - a);
+            *slice_lo = a; *slice_hi = e; *slice_off = p->off + (uint64_t)(a - p->lo);
+        }
+    }
+    return best >= VKFR_MIN_RESIDENT;
+}
+// A single, bounded /proc/self/smaps snapshot attributes SwapPss to the
+// process's actual mappings. This is diagnostic, not a reclaim operation.
+// It may be denied by SELinux, and VMAs can change during the read.
+static void fbr_swapdiag_record(const vksm_vma *v, uint64_t by_group[VKSM_GROUPS],
+                                vksm_vma top[VKSM_TOP], uint64_t *sum, int *n) {
+    (*n)++;
+    by_group[vksm_group(v->name)] += v->swap_kb;
+    *sum += v->swap_kb;
+    if (!v->swap_kb) return;
+    for (int i = 0; i < VKSM_TOP; i++) if (v->swap_kb > top[i].swap_kb) {
+        if (i + 1 < VKSM_TOP)
+            memmove(&top[i + 1], &top[i], (size_t)(VKSM_TOP - i - 1) * sizeof *top);
+        top[i] = *v;
+        return;
+    }
+}
+static void fbr_swapdiag_once(void) {
+    FILE *f = fopen("/proc/self/smaps", "r");
+    if (!f) {
+        VLOG("swapmap diagnostic: /proc/self/smaps unreadable (%s); no mapping attribution", strerror(errno));
+        return;
+    }
+    uint64_t by_group[VKSM_GROUPS] = {0}, sum = 0, read_bytes = 0;
+    vksm_vma top[VKSM_TOP] = {{0}}, cur = {0};
+    int have = 0, count = 0, truncated = 0;
+    char line[768];
+    while (fgets(line, sizeof line, f)) {
+        read_bytes += strlen(line);
+        if (read_bytes > VKSM_MAX_BYTES) { truncated = 1; break; }
+        vksm_vma found;
+        if (vksm_map_line(line, &found)) {
+            if (have) fbr_swapdiag_record(&cur, by_group, top, &sum, &count);
+            cur = found; have = 1;
+        } else if (have) {
+            uint64_t kb;
+            if (vksm_field_kb(line, "SwapPss:", &kb)) cur.swap_kb = kb;
+            else if (vksm_field_kb(line, "Rss:", &kb)) cur.rss_kb = kb;
+        }
+    }
+    if (have) fbr_swapdiag_record(&cur, by_group, top, &sum, &count);
+    int read_err = ferror(f);
+    fclose(f);
+    VLOG("swapmap diagnostic (one snapshot): %d VMAs, %.1f MiB SwapPss total; guest-named %.1f, GPU-named %.1f, other anonymous %.1f, file path %.1f MiB; %llu MiB smaps text scanned%s%s. This is approximate and not additive to Vulkan allocation accounting",
+         count, sum / 1024.0, by_group[VKSM_GUEST] / 1024.0, by_group[VKSM_GPU] / 1024.0,
+         by_group[VKSM_ANON] / 1024.0, by_group[VKSM_FILE] / 1024.0,
+         (unsigned long long)((read_bytes + 1048575) >> 20),
+         truncated ? " (SCAN LIMIT HIT: partial totals)" : "",
+         read_err ? " (smaps read error)" : "");
+    for (int i = 0; i < VKSM_TOP && top[i].swap_kb; i++)
+        VLOG("swapmap top #%d: SwapPss %.1f MiB, RSS %.1f MiB, address %#llx+%.1f MiB, %s",
+             i + 1, top[i].swap_kb / 1024.0, top[i].rss_kb / 1024.0,
+             (unsigned long long)top[i].lo, (top[i].hi - top[i].lo) / 1048576.0, top[i].name);
 }
 static void *fbr_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-fb-reclaim");
     unsigned consecutive = 0;
+    int swapdiag_done = 0;
     for (;;) {
         sleep(VKFR_POLL_SEC);
         if (!VKA_ENV("DM_MEM_FILEBACK_RECLAIM", 0)) { consecutive = 0; continue; }
@@ -1500,45 +1586,69 @@ static void *fbr_main(void *arg) {
         if (avail <= reserve) { if (consecutive < 3) consecutive++; }
         else { consecutive = 0; continue; }
         if (!vkfr_pressure(total, avail, consecutive)) continue;
-        uintptr_t lo = 0, hi = 0; uint64_t off = 0, now = mono_ns();
-        pthread_mutex_lock(&g_fbmu);
-        for (int i = 0; i < g_nfbr; i++) {
-            fbr_cand *c = &g_fbr[i];
-            if (!vkfr_due(now, c->born, c->last)) continue;
-            uint64_t remain = c->hi - c->lo - c->cursor;
-            uint64_t n = remain < FBRC_CHUNK ? remain : FBRC_CHUNK;
-            uintptr_t a = c->lo + c->cursor, e = a + n;
-            uint64_t o = c->off + c->cursor;
-            c->last = now;
-            c->cursor = c->cursor + n == c->hi - c->lo ? 0 : c->cursor + n;
-            if (!fbr_piece_live(a, e, o)) continue;
-            lo = a; hi = e; off = o; break;
+        if (!swapdiag_done && VKA_ENV("DM_VK_SWAPMAP_DIAG", 0)) {
+            swapdiag_done = 1;
+            fbr_swapdiag_once();  // once per run, without holding placement/file mutexes
         }
-        pthread_mutex_unlock(&g_fbmu);
-        if (!lo) continue;
-        uint64_t before = 0, after = 0; int observed = 0, attempted = 0, rc = 0;
-        // g_pl excludes placement/finalization; g_fbmu also excludes release
-        // (fb_gone(back=0) doesn't acquire g_pl). At most 128 MiB per attempt.
+        const uint64_t now = mono_ns();
+        uintptr_t best_lo = 0, best_hi = 0; uint64_t best_off = 0, best_res = 0, after = 0;
+        int best_idx = -1, checked = 0, available_pools = 0, failures = 0;
+        int advised = 0, advice_result = 0, after_ok = 0;
+        unsigned char visited[FBRC_MAX] = {0};
+        // g_pl excludes pool placements and finalizations; g_fbmu also
+        // excludes releases that do not take g_pl. Keep each probe and the
+        // eventual PAGEOUT in one coherent, protected mapping generation.
         pthread_mutex_lock(&g_pl);
         pthread_mutex_lock(&g_fbmu);
-        int live = fbr_piece_live(lo, hi, off);
-        if (live) {
-            observed = !vkfb_resident_bytes(lo, hi - lo, &before);
-            if (observed && vkfr_resident(before)) {
-                attempted = 1;
-                rc = vkfb_pageout(lo, hi - lo);
-                if (!rc) observed = !vkfb_resident_bytes(lo, hi - lo, &after);
+        fbr_prune_locked();
+        available_pools = g_nfbr;
+        unsigned limit = (unsigned)g_nfbr * VKFR_SCAN_MAX;
+        for (unsigned it = 0; it < limit && checked < (int)VKFR_SCAN_MAX; it++) {
+            int idx = (int)g_fbr_next;
+            if (++g_fbr_next == (unsigned)g_nfbr) g_fbr_next = 0;
+            fbr_cand *c = &g_fbr[idx];
+            if (!vkfr_due(now, c->born, c->last)) continue;
+            uint64_t size = c->hi - c->lo;
+            if (!size || visited[idx] >= 1 + (size - 1) / FBRC_CHUNK) continue;
+            visited[idx]++;
+            uint64_t cursor = c->cursor < size ? c->cursor : 0;
+            uintptr_t lo = c->lo + cursor;
+            uintptr_t hi = lo + (size - cursor < FBRC_CHUNK ? size - cursor : FBRC_CHUNK);
+            c->cursor = vkfr_next_cursor(cursor, size, FBRC_CHUNK);
+            uintptr_t a = 0, e = 0; uint64_t off = 0, resident = 0;
+            if (!fbr_slice_locked(c, lo, hi, &a, &e, &off)) continue;
+            checked++;
+            if (vkfb_resident_bytes(a, (size_t)(e - a), &resident)) { failures++; continue; }
+            if (best_idx < 0 || resident > best_res) {
+                best_idx = idx; best_lo = a; best_hi = e;
+                best_off = off; best_res = resident;
             }
+        }
+        if (best_idx >= 0 && vkfr_resident(best_res)) {
+            // Do not retry the same pool within 30s after requesting PAGEOUT;
+            // zero-resident probes do NOT consume its cooldown.
+            g_fbr[best_idx].last = now;
+            advised = 1;
+            advice_result = vkfb_pageout(best_lo, (size_t)(best_hi - best_lo));
+            if (!advice_result)
+                after_ok = !vkfb_resident_bytes(best_lo, (size_t)(best_hi - best_lo), &after);
         }
         pthread_mutex_unlock(&g_fbmu);
         pthread_mutex_unlock(&g_pl);
         static _Atomic unsigned nlog;
         unsigned k = atomic_fetch_add(&nlog, 1);
-        if (k < 20 || !(k & 63))
-            VLOG("file-backed deferred PAGEOUT: %s %#lx+%.0f MiB (file offset %.0f MiB), MemAvailable %.0f MiB, resident %.1f -> %.1f MiB (%s), %s; not measured RAM saved",
-                 live ? "verified" : "changed/skip", (unsigned long)lo, (hi-lo)/1048576.0, off/1048576.0, avail/1024.0,
-                 before/1048576.0, after/1048576.0, observed ? "mincore" : "unknown",
-                 attempted ? (rc ? strerror(-rc) : "MADV_PAGEOUT accepted") : "skipped: no resident pages or mapping changed");
+        if (k < 24 || !(k & 63)) {
+            VLOG("file-backed deferred PAGEOUT survey: MemAvailable %.0f MiB, %d mapped candidates, %d file slices checked (max %u), %d mincore failures; best %.1f MiB resident in %.0f MiB at %#lx (file offset %.0f MiB); %s%s%s; advisory, not measured RAM saved",
+                 avail / 1024.0, available_pools, checked, VKFR_SCAN_MAX, failures,
+                 best_res / 1048576.0, best_idx >= 0 ? (best_hi - best_lo) / 1048576.0 : 0.0,
+                 (unsigned long)best_lo, best_off / 1048576.0,
+                 advised ? (advice_result ? strerror(-advice_result) : "MADV_PAGEOUT accepted") : "no qualifying resident slice",
+                 advised && !advice_result ? (after_ok ? ", residency measured afterward" : ", post-advice mincore failed") : "",
+                 advised && !advice_result && after_ok ? ", see resident change in following line" : "");
+            if (advised && !advice_result && after_ok)
+                VLOG("file-backed deferred PAGEOUT residency: %.1f -> %.1f MiB on the same slice (mincore measures cache residency, not PSS)",
+                     best_res / 1048576.0, after / 1048576.0);
+        }
     }
     return NULL;
 }
@@ -1547,7 +1657,8 @@ static void fbr_start_once(void) {
     if (pthread_create(&th, NULL, fbr_main, NULL))
         VRED("file-backed deferred PAGEOUT: worker could not start");
     else { pthread_detach(th);
-        VLOG("file-backed deferred PAGEOUT: monitoring file-backed textures every 5 s; two low-memory samples, 128 MiB per hint, 30 s per-pool cooldown, no PSI; opt out DM_MEM_FILEBACK_RECLAIM=0");
+        VLOG("file-backed deferred PAGEOUT: surveying up to %u file slices of <=%.0f MiB every 5 s after two low-memory samples; one PAGEOUT max per tick, 30 s pool cooldown, no PSI, DM_MEM_FILEBACK_RECLAIM=0 opt-out",
+             VKFR_SCAN_MAX, FBRC_CHUNK / 1048576.0);
     }
 }
 // The readable runs of a range (vka_fileback.h's copies): 0 = a run is not mapped or the runs were not read (not moved then)
@@ -1605,6 +1716,7 @@ void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) {   // hle_n
         g_fbs.pools++; g_fbs.moved += copied; atomic_store(&g_fb_n, g_fb.n);
         nlog = g_fbs.pools <= 8 || !(g_fbs.pools & 63);
         if (kind == 2 && VKA_ENV("DM_MEM_FILEBACK_RECLAIM", 0) && vkfr_candidate(size, copied)) {
+            if (g_nfbr == FBRC_MAX) fbr_prune_locked(); // scene transitions may leave stale historical candidates
             if (g_nfbr < FBRC_MAX) {
                 g_fbr[g_nfbr++] = (fbr_cand){.lo=lo, .hi=hi, .off=(uint64_t)off, .born=mono_ns()};
                 candidate_added = 1;

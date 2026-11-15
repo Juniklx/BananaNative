@@ -7,7 +7,14 @@
 #define VKFR_POLL_SEC 5u
 #define VKFR_AGE_NS (10ull * 1000000000ull)
 #define VKFR_COOLDOWN_NS (30ull * 1000000000ull)
-#define VKFR_MIN_RESIDENT (32ull * VKFR_MIB)
+#define VKFR_MIN_RESIDENT (8ull * VKFR_MIB)
+#define VKFR_SLICE_BYTES (64ull * VKFR_MIB)
+#define VKFR_SCAN_MAX 8u
+// Advance to the next non-overlapping slice; wrap without overflowing.
+static inline uint64_t vkfr_next_cursor(uint64_t cursor, uint64_t size, uint64_t slice) {
+    if (!size || !slice || cursor >= size || size - cursor <= slice) return 0;
+    return cursor + slice;
+}
 static inline int vkfr_candidate(uint64_t size, uint64_t bytes_copied) {
     return size >= 64 * VKFR_MIB && bytes_copied >= 16 * VKFR_MIB;
 }

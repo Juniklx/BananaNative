@@ -45,6 +45,9 @@ jobs:
           cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
             -o "$RUNNER_TEMP/t_vka_fileback_reclaim" dm/host/tests/t_vka_fileback_reclaim.c
           "$RUNNER_TEMP/t_vka_fileback_reclaim"
+          cc -std=c11 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined \
+            -o "$RUNNER_TEMP/t_vka_swapmap_diag" dm/host/tests/t_vka_swapmap_diag.c
+          "$RUNNER_TEMP/t_vka_swapmap_diag"
           cc -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined \
             -o "$RUNNER_TEMP/t_android_texlimit" dm/host/tests/t_android_texlimit.c
           "$RUNNER_TEMP/t_android_texlimit"

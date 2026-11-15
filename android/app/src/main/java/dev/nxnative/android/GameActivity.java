@@ -459,6 +459,7 @@ public final class GameActivity extends Activity implements SurfaceHolder.Callba
         if (TextureQuality.supports(id)) {
             env.add("DM_VK_STAGING_PRESSURE=1");   // Zelda-only pressure-aware GPU staging
             env.add("DM_MEM_FILEBACK_RECLAIM=1"); // Deferred, reversible PAGEOUT of file-backed textures under sustained low RAM
+            env.add("DM_VK_SWAPMAP_DIAG=1");     // One low-RAM smaps snapshot attributing SwapPss; user environment can disable
         }   // env.txt / the game's own environment wins
         String padMap = Prefs.padMap(this, id);   // Button mapping (Game settings, Settings): wins over the label swap's A/B for the buttons it names
         if (!padMap.isEmpty()) env.add("DM_PAD_MAP=" + padMap);
