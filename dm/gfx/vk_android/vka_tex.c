@@ -1686,6 +1686,10 @@ static void vka_tex_prune_locked(uint64_t incoming) {
     uint64_t queued_fence = diag ? vka_fence_queued() : 0;
     int diag_fence_queued = 0, diag_fence_unsent = 0;
     uint64_t diag_fence_queued_bytes = 0, diag_fence_unsent_bytes = 0;
+    // Opt-in, bounded diagnostics: the largest not-yet-submitted images may
+    // identify expensive resource overlap without relaxing any lifetime rule.
+    enum { DIAG_UNSENT_TOP = 6 };
+    vka_img *diag_unsent_top[DIAG_UNSENT_TOP] = {0};
     int diag_pool = 0, diag_holds = 0, diag_fence = 0, diag_video = 0;
     int diag_recent = 0, diag_gpu_grace = 0, diag_never = 0;
     uint64_t diag_bytes[8] = {0}; // eligible, pool, held, fence, video, never/current, recent, gpu grace
@@ -1718,7 +1722,17 @@ static void vka_tex_prune_locked(uint64_t incoming) {
             else if (pending) {
                 diag_fence++; diag_bytes[3] += im->bytes;
                 if (im->last_fence <= queued_fence) { diag_fence_queued++; diag_fence_queued_bytes += im->bytes; }
-                else { diag_fence_unsent++; diag_fence_unsent_bytes += im->bytes; }
+                else {
+                    diag_fence_unsent++; diag_fence_unsent_bytes += im->bytes;
+                    int at = 0;
+                    while (at < DIAG_UNSENT_TOP && diag_unsent_top[at] &&
+                           diag_unsent_top[at]->bytes >= im->bytes) at++;
+                    if (at < DIAG_UNSENT_TOP) {
+                        for (int k = DIAG_UNSENT_TOP - 1; k > at; k--)
+                            diag_unsent_top[k] = diag_unsent_top[k - 1];
+                        diag_unsent_top[at] = im;
+                    }
+                }
             }
             else if (!im->last_frame || cur_frame <= im->last_frame) { diag_never++; diag_bytes[5] += im->bytes; }
             else if (im->gpu_owned) { diag_gpu_grace++; diag_bytes[7] += im->bytes; }
@@ -1741,6 +1755,13 @@ static void vka_tex_prune_locked(uint64_t incoming) {
                  (unsigned long long)done_fence, (unsigned long long)queued_fence,
                  diag_fence_queued, diag_fence_queued_bytes / 1048576.0,
                  diag_fence_unsent, diag_fence_unsent_bytes / 1048576.0);
+            for (int k = 0; k < DIAG_UNSENT_TOP && diag_unsent_top[k]; k++) {
+                const vka_img *im = diag_unsent_top[k];
+                VLOG("image prune unsent top %d: serial %llu, %ux%u layers %u, NVN format %#x, %.1f MiB, last fence %llu, GPU-owned %d (protected until submitted/completed)",
+                     k + 1, (unsigned long long)im->serial, im->w, im->h,
+                     im->layers, im->d.format, im->bytes / 1048576.0,
+                     (unsigned long long)im->last_fence, im->gpu_owned != 0);
+            }
         }
     }
     qsort(c, (size_t)nc, sizeof *c, prune_cmp);
