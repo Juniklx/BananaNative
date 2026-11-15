@@ -713,7 +713,7 @@ final class GameSettings {
 
     private static void textureQuality(MainActivity a, Game g, Runnable done) {
         new AlertDialog.Builder(a).setTitle("Texture quality · " + g.name)
-                .setMessage("Experimental: only large block-compressed textures with mipmaps from the game's files. Render targets and original texture pools are not reduced. Restart to apply.")
+                // Android's AlertDialog can hide its single-choice list when both message and items are provided.
                 .setSingleChoiceItems(TextureQuality.NAMES, Prefs.textureQuality(a, g.titleId), (d, w) -> {
                     Prefs.textureQuality(a, g.titleId, w);
                     d.dismiss();
