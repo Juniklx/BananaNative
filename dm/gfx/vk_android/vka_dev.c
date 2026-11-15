@@ -843,7 +843,9 @@ static uint64_t os_mem_kb(const char *line, const char *key) {
 }
 static void os_memlog(void) {
     if (!VKA_ENV("DM_VK_PROC_MEMLOG", 0)) return;
-    uint64_t pss = 0, rss = 0, swap_pss = 0, vmrss = 0, vmhwm = 0, vmswap = 0, available = 0;
+    uint64_t pss = 0, rss = 0, swap_pss = 0, pss_anon = 0, pss_file = 0, pss_shmem = 0;
+    uint64_t vmrss = 0, vmhwm = 0, vmswap = 0, available = 0;
+    int pss_classes = 0;
     int rollup_ok = 0, status_ok = 0;
     char line[256];
     FILE *f = fopen("/proc/self/smaps_rollup", "r");
@@ -853,6 +855,9 @@ static void os_memlog(void) {
             if ((v = os_mem_kb(line, "Pss"))) pss = v;
             else if ((v = os_mem_kb(line, "Rss"))) rss = v;
             else if ((v = os_mem_kb(line, "SwapPss"))) swap_pss = v;
+            else if ((v = os_mem_kb(line, "Pss_Anon"))) { pss_anon = v; pss_classes |= 1; }
+            else if ((v = os_mem_kb(line, "Pss_File"))) { pss_file = v; pss_classes |= 2; }
+            else if ((v = os_mem_kb(line, "Pss_Shmem"))) { pss_shmem = v; pss_classes |= 4; }
         }
         rollup_ok = !ferror(f);
         fclose(f);
@@ -880,6 +885,9 @@ static void os_memlog(void) {
              pss / 1024.0, rss / 1024.0, swap_pss / 1024.0);
     else
         VLOG("memory process: /proc/self/smaps_rollup unavailable (PSS not measured)");
+    if (rollup_ok && pss_classes == 7)
+        VLOG("memory process PSS breakdown: anon %.1f MiB, file %.1f MiB, shmem %.1f MiB (process resident proportional pages; swap separately above)",
+             pss_anon / 1024.0, pss_file / 1024.0, pss_shmem / 1024.0);
     if (status_ok)
         VLOG("memory process: status VmRSS %.1f MiB, VmHWM %.1f MiB, VmSwap %.1f MiB; system MemAvailable %.1f MiB",
              vmrss / 1024.0, vmhwm / 1024.0, vmswap / 1024.0, available / 1024.0);
