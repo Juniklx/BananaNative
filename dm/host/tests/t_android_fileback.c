@@ -33,6 +33,19 @@ static uint8_t pat(int page, int i) { return (uint8_t)(page * 31 + i * 7 + 1); }
 static void *writer(void *arg) { (void)arg; while (!atomic_load(&g_swap)) sched_yield(); g_lo[5 * PG + 100] = 0xAB; return NULL; }
 
 int main(void) {
+    // The conservative PAGEOUT mode acts only during observed memory pressure;
+    // unknown metrics must never silently enable reclaim.
+    const uint64_t total = 7224ull * 1024, reserve = total / 8;
+    CHECK(!vkfb_pageout_policy(0, total, 100 * 1024, 30.0), "PAGEOUT=0 is off");
+    CHECK(vkfb_pageout_policy(1, 0, 0, -1.0), "PAGEOUT=1 preserves immediate opt-in");
+    CHECK(!vkfb_pageout_policy(2, 0, 0, 20.0), "unknown meminfo fails closed");
+    CHECK(!vkfb_pageout_policy(2, total, 0, 20.0), "unknown MemAvailable fails closed");
+    CHECK(!vkfb_pageout_policy(2, total, reserve, -1.0), "unknown PSI fails closed");
+    CHECK(!vkfb_pageout_policy(2, total, reserve, 4.9), "low PSI prevents reclaim");
+    CHECK(!vkfb_pageout_policy(2, total, 3ull * 1024 * 1024, 20.0), "ample RAM prevents reclaim");
+    CHECK(vkfb_pageout_policy(2, total, reserve, 5.0), "pressure at reserve and PSI threshold");
+    CHECK(vkfb_pageout_policy(2, total, reserve / 2, 15.0), "sustained PSI and low headroom");
+    CHECK(!vkfb_pageout_policy(3, total, reserve / 2, 15.0), "unknown modes fail closed");
     const char *dir = getenv("TMPDIR"); if (!dir || !*dir) dir = "/tmp";
     struct sigaction sa = {0}; sa.sa_sigaction = on_segv; sa.sa_flags = SA_SIGINFO; sigaction(SIGSEGV, &sa, NULL);
     int pm = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
