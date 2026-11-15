@@ -803,6 +803,7 @@ static void *completion_main(void *arg) {
 
 // ---------- Scratch memory ----------
 #include "vka_scratch_policy.h"
+#include "vka_staging_pressure.h"
 // Blocks of host-visible memory handed out linearly. Two owners: the submission being recorded (class 0: the blocks retire at its fence, vka_scratch_retire) and the
 // open upload batch (class 1, while vka_scr_up is set on the calling thread: the blocks retire at the batch's value on the upload timeline, vka_up_flush). A block goes
 // back to use once that value is reached
@@ -840,6 +841,49 @@ uint64_t vka_scratch_bytes(uint32_t *blocks) { if (blocks) *blocks = atomic_load
 static uint64_t os_mem_kb(const char *line, const char *key) {
     size_t n = strlen(key);
     return !strncmp(line, key, n) && line[n] == ':' ? strtoull(line + n + 1, NULL, 10) : 0;
+}
+// Opt-in pressure-sensitive staging limits. Small /proc reads are cached for
+// 500 ms under a separate mutex and shared by uploads and scratch retirement.
+// This policy never discards in-flight or open GPU resources.
+static pthread_mutex_t g_spmu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_sp_at;
+static int g_sp_active;
+static int staging_pressure(void) {
+    if (!VKA_ENV("DM_VK_STAGING_PRESSURE", 0)) return 0;
+    pthread_mutex_lock(&g_spmu);
+    uint64_t now = now_ns();
+    if (!g_sp_at || now < g_sp_at || now - g_sp_at >= VKSP_POLL_NS) {
+        g_sp_at = now;
+        uint64_t total_kb = 0, avail_kb = 0;
+        double psi = -1.0;
+        char line[256];
+        FILE *f = fopen("/proc/meminfo", "r");
+        if (f) {
+            while (fgets(line, sizeof line, f)) {
+                if (!strncmp(line, "MemTotal:", 9)) total_kb = os_mem_kb(line, "MemTotal");
+                else if (!strncmp(line, "MemAvailable:", 13)) avail_kb = os_mem_kb(line, "MemAvailable");
+                if (total_kb && avail_kb) break;
+            }
+            fclose(f);
+        }
+        f = fopen("/proc/pressure/memory", "r");
+        if (f) {
+            if (fgets(line, sizeof line, f)) {
+                const char *p = strstr(line, "some avg10=");
+                if (p) psi = strtod(p + strlen("some avg10="), NULL);
+            }
+            fclose(f);
+        }
+        int active = vksp_pressed(total_kb, avail_kb, psi);
+        if (active != g_sp_active)
+            VLOG("staging pressure: %s (MemAvailable %.0f MiB, MemTotal %.0f MiB, PSI some avg10 %.1f%%): %s",
+                 active ? "on" : "off", avail_kb / 1024.0, total_kb / 1024.0, psi,
+                 active ? "discard completed idle scratch; reduce upload in-flight cap to at most 128 MiB" : "use configured staging limits");
+        g_sp_active = active;
+    }
+    int active = g_sp_active;
+    pthread_mutex_unlock(&g_spmu);
+    return active;
 }
 static void os_memlog(void) {
     if (!VKA_ENV("DM_VK_PROC_MEMLOG", 0)) return;
@@ -912,7 +956,7 @@ void vka_mem_grew(uint64_t bytes) {
 static VkDeviceSize scratch_idle_limit(void) {
     int mb = VKA_ENV("DM_VK_SCRATCH_IDLE_MB", 64);
     if (mb < 0 || mb > 64) mb = 64;
-    return (VkDeviceSize)mb << 20;
+    return vksp_idle_limit((VkDeviceSize)mb << 20, staging_pressure());
 }
 static void sblk_trim(uint64_t done, uint64_t udone) {
     VkDeviceSize idle = 0, freed = 0, limit = scratch_idle_limit();
@@ -1066,7 +1110,7 @@ void vka_up_flush(void) {
 // replay thread holds no lock (vka_tex_get after the table lock, chunk, the commit): the present and other threads that take the image table do not wait for the GPU
 void vka_up_throttle(void) {
     if (!g_utl) return;
-    double cap = VKA_ENVF("DM_VK_UPLOAD_INFLIGHT_MB", 256.0) * 1048576.0;
+    double cap = vksp_upload_limit(VKA_ENVF("DM_VK_UPLOAD_INFLIGHT_MB", 256.0) * 1048576.0, staging_pressure());
     for (;;) {
         uint64_t udone = up_done(), oldest = UINT64_MAX; VkDeviceSize fl = 0;
         pthread_mutex_lock(&g_smu);
