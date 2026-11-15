@@ -202,6 +202,15 @@ For a run past the opening, copy the committed save folder to the new run's `DM_
 - The Kokiri Forest checkpoint save (`slot_00/progress.sav` and `slot_00/caption.sav`) must be present in `DM_SAVE` to load directly into active 3D gameplay; without it, the game remains in attract/title sequence.
 
 
+### Low-RAM startup on Exynos/Xclipse (Galaxy S24 FE, 2026-11-15)
+
+Player-provided startup logs on an ~7.2 GiB Android device, RADV Xclipse Mesa 27.0.0-devel, build `fbfceab` with `DM_VK_IMG_PREPRUNE=1`, `DM_VK_PRUNE_DIAG=1`, `DM_NVN_POOLS=1` and `DM_VK_UPLOAD_INFLIGHT_MB=64`: `0400486024DEC000-20261114-234605.log` (`DM_VK_PLACE_PART_MB=256`) and `0400486024DEC000-20261114-235952.log` (`DM_VK_PLACE_PART_MB=64`). These are different-length captures and neither includes Android exit information, so a decrease in total peak RAM or a fix for low-memory kills is **not** established.
+
+- Lowering the partial-placement threshold from 256 to 64 MiB reduced the maximum **placed-pool** accounting from 922 to 858 MiB (64 MiB). An 88 MiB NVN pool formerly placed whole was placed in only 16 + 8 MiB segments; this accounts for the observed 64 MiB difference, not a drop in the entire app's RSS/PSS.
+- There was overhead: a ~150 MiB pool ended up wholly placed and required two part joins of 18.6 + 80.3 ms. Lowering the threshold further may cause additional joins without net savings.
+- At the same large depth texture allocation (12288 × 12288 D16, 288 MiB guest storage, 297 MiB Vulkan allocation), preprune evicted 46.7 MiB in each run. The image cache had **115 images / 339.3 MiB protected by unfinished GPU fences** and 3 held images / 45.2 MiB; it is not safe to evict them merely because a new image would exceed the cache limit. The maximum Vulkan-accounted total across the different captures was 1758 vs 1751 MiB, **not an apples-to-apples peak comparison**.
+- Commit `881a44b` adds an opt-in diagnostic line (`DM_VK_PRUNE_DIAG=1`) splitting fence-protected image bytes into *GPU-queued* and *not-yet-queued*. This is needed to distinguish potentially completable GPU work from an unfinished recording before trying a bounded pre-allocation wait. No wait or eviction-policy change was enabled by this commit; on-device results for the new line are pending.
+
 ### Vegetation detail on Android
 
 [Full vegetation](../../../docs/reference/rendering.md#dense-vegetation-in-the-kokiri-forest) is on by default in Game settings. Turning it off removes some grass and tree foliage at the next launch. The profile lists seven depth and colour pairs. Three other pairs include shaders that declare guest writes and stay active.
