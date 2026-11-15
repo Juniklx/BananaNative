@@ -1624,7 +1624,7 @@ static void img_evict_locked(vka_img *im) {
 // used first, never one used in this frame or the last; a working set larger than the limit stays (logged), as uploading it again every frame costs far more than the memory
 static uint64_t g_img_lim, g_lim_frame, g_prune_dry, g_lim_monotonic_ns;
 static uint32_t g_img_keep_frames = VKTL_KEEP_FRAMES;
-static int g_img_ram_guard;
+static int g_img_ram_guard, g_img_ram_known;
 static int g_psi_pressed;   // memory pressure past VKTL_PSI_HOLD at the last update: measured every 15 frames instead of 60
 static uint64_t meminfo_kb(const char *buf, const char *key) { const char *p = strstr(buf, key); return p ? strtoull(p + strlen(key), NULL, 10) : 0; }
 static uint64_t image_prune_now_ns(void) {
@@ -1669,6 +1669,7 @@ static void img_limit_update(uint64_t cur_frame) {   // caller holds g_tmu
     uint32_t old_keep = g_img_keep_frames;
     g_img_keep_frames = vktl_adaptive_keep(VKA_ENV("DM_VK_IMG_KEEP_FRAMES", VKTL_KEEP_FRAMES),
                                             in.mem_total, in.mem_avail, in.psi_some10);
+    g_img_ram_known = in.mem_total && in.mem_avail;
     g_img_ram_guard = env <= 0 && ram_guard ? vktl_ram_pressure(in.mem_total, in.mem_avail) : 0;
     if (g_img_ram_guard)
         lim = vktl_android_fallback_limit(lim, imgs, in.mem_total, in.mem_avail, in.psi_some10);
@@ -1804,7 +1805,7 @@ static void vka_tex_prune_locked(uint64_t incoming) {
     // allocation, and never when available RAM is below the reserve.
     int budget_setting = VKA_ENV("DM_VK_PRUNE_MS", 0);
     uint32_t budget_ms = budget_setting > 30 ? 30 : budget_setting > 0 ? (uint32_t)budget_setting : 0;
-    int critical_ram = g_img_ram_guard > 0 || !g_img_lim;
+    int critical_ram = g_img_ram_guard > 0 || !g_img_ram_known;
     uint64_t started = budget_ms && !critical_ram && !incoming ? image_prune_now_ns() : 0;
     int budget_hit = 0;
     uint64_t target = vktl_target(limit_bytes), bytes_freed = 0; int pruned = 0;
@@ -1814,7 +1815,8 @@ static void vka_tex_prune_locked(uint64_t incoming) {
         uint64_t after = g_img_bytes + vka_imem_zbytes(), b = before > after ? before - after : 0;
         pruned++; bytes_freed += b; total_bytes = after;
         if (started) {
-            uint64_t elapsed = image_prune_now_ns() - started;
+            uint64_t now = image_prune_now_ns();
+            uint64_t elapsed = now >= started ? now - started : 0;
             if (vktl_prune_time_hit(elapsed, budget_ms, critical_ram, incoming)) {
                 budget_hit = 1;
                 break;
