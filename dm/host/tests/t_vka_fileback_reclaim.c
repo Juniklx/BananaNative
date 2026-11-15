@@ -25,6 +25,11 @@ int main(void) {
     CHECK(!vkfr_due(5, 10, 0));
     CHECK(!vkfr_resident(31*M));
     CHECK(vkfr_resident(32*M));
+    CHECK(vkfr_piece_covers(0x100000, 0x200000, 0x400000, 0x180000, 0x190000, 0x480000));
+    CHECK(!vkfr_piece_covers(0x180000, 0x200000, 0x480000, 0x100000, 0x110000, 0x400000));
+    CHECK(!vkfr_piece_covers(0x100000, 0x200000, 0x500000, 0x180000, 0x190000, 0x480000));
+    CHECK(!vkfr_piece_covers(0x100000, 0x200000, 0x400000, 0x180000, 0x210000, 0x480000));
+    CHECK(!vkfr_piece_covers(0x100000, 0x200000, UINT64_MAX, 0x180000, 0x190000, 0x7ffff));
     puts("t_vka_fileback_reclaim: ok");
     return 0;
 }
