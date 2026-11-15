@@ -38,6 +38,7 @@
 #include "vka_mapbudget.h"
 #include "vka_fd_alias.h"
 #include "vka_fileback.h"
+#include "vka_fileback_reclaim.h"
 
 static void fb_placed(uintptr_t lo, uintptr_t hi);           // File-backed pools (below): a placement took [lo, hi) from the file
 static void fb_gone(uintptr_t lo, uintptr_t hi, int back);   // a pool's range finalized (back 1: its pieces go back to anonymous memory) or released (0: dropped)
@@ -1455,6 +1456,99 @@ int dm_gfx_fileback_line(char *b, size_t n) {   // hle_nvn.c shp_report: the tot
     int any = g_fbs.pools || g_fbs.fails; if (any) fb_line(b, n);
     pthread_mutex_unlock(&g_fbmu);
     return any;
+}
+// Optional deferred file-cache PAGEOUT: eligibility is proven when a
+// texture pool is copied into a file; a page range is checked again under
+// both locks before the advisory call. Never frees guest or Vulkan memory.
+enum { FBRC_MAX = 64 };
+#define FBRC_CHUNK (128ull * VKFR_MIB)
+typedef struct { uintptr_t lo, hi; uint64_t off, born, last, cursor; } fbr_cand;
+static fbr_cand g_fbr[FBRC_MAX];  // guarded by g_fbmu
+static int g_nfbr;
+static pthread_once_t g_fbr_once = PTHREAD_ONCE_INIT;
+static int fbr_meminfo(uint64_t *total, uint64_t *avail) {
+    *total = *avail = 0;
+    FILE *f = fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, "MemTotal:", 9)) *total = strtoull(line + 9, NULL, 10);
+        else if (!strncmp(line, "MemAvailable:", 13)) *avail = strtoull(line + 13, NULL, 10);
+        if (*total && *avail) break;
+    }
+    fclose(f);
+    return *total && *avail;
+}
+static int fbr_piece_live(uintptr_t lo, uintptr_t hi, uint64_t off) {
+    // Caller holds g_fbmu. Partial placements may split the original pool.
+    for (int i = 0; i < g_fb.n; i++) {
+        const vkfb_piece *p = &g_fb.p[i];
+        if (p->lo <= lo && p->hi >= hi && p->off + (lo - p->lo) == off) return 1;
+    }
+    return 0;
+}
+static void *fbr_main(void *arg) {
+    (void)arg; pthread_setname_np(pthread_self(), "vk-fb-reclaim");
+    unsigned consecutive = 0;
+    for (;;) {
+        sleep(VKFR_POLL_SEC);
+        if (!VKA_ENV("DM_MEM_FILEBACK_RECLAIM", 0)) { consecutive = 0; continue; }
+        uint64_t total, avail;
+        if (!fbr_meminfo(&total, &avail)) { consecutive = 0; continue; }
+        uint64_t reserve = total / 8;
+        if (reserve < 512ull * 1024) reserve = 512ull * 1024;
+        if (avail <= reserve) { if (consecutive < 3) consecutive++; }
+        else { consecutive = 0; continue; }
+        if (!vkfr_pressure(total, avail, consecutive)) continue;
+        uintptr_t lo = 0, hi = 0; uint64_t off = 0, now = mono_ns();
+        pthread_mutex_lock(&g_fbmu);
+        for (int i = 0; i < g_nfbr; i++) {
+            fbr_cand *c = &g_fbr[i];
+            if (!vkfr_due(now, c->born, c->last)) continue;
+            uint64_t remain = c->hi - c->lo - c->cursor;
+            uint64_t n = remain < FBRC_CHUNK ? remain : FBRC_CHUNK;
+            uintptr_t a = c->lo + c->cursor, e = a + n;
+            uint64_t o = c->off + c->cursor;
+            c->last = now;
+            c->cursor = c->cursor + n == c->hi - c->lo ? 0 : c->cursor + n;
+            if (!fbr_piece_live(a, e, o)) continue;
+            lo = a; hi = e; off = o; break;
+        }
+        pthread_mutex_unlock(&g_fbmu);
+        if (!lo) continue;
+        uint64_t before = 0, after = 0; int observed = 0, attempted = 0, rc = 0;
+        // g_pl excludes placement/finalization; g_fbmu also excludes release
+        // (fb_gone(back=0) doesn't acquire g_pl). At most 128 MiB per attempt.
+        pthread_mutex_lock(&g_pl);
+        pthread_mutex_lock(&g_fbmu);
+        int live = fbr_piece_live(lo, hi, off);
+        if (live) {
+            observed = !vkfb_resident_bytes(lo, hi - lo, &before);
+            if (observed && vkfr_resident(before)) {
+                attempted = 1;
+                rc = vkfb_pageout(lo, hi - lo);
+                if (!rc) observed = !vkfb_resident_bytes(lo, hi - lo, &after);
+            }
+        }
+        pthread_mutex_unlock(&g_fbmu);
+        pthread_mutex_unlock(&g_pl);
+        static _Atomic unsigned nlog;
+        unsigned k = atomic_fetch_add(&nlog, 1);
+        if (k < 20 || !(k & 63))
+            VLOG("file-backed deferred PAGEOUT: %s %#lx+%.0f MiB (file offset %.0f MiB), MemAvailable %.0f MiB, resident %.1f -> %.1f MiB (%s), %s; not measured RAM saved",
+                 live ? "verified" : "changed/skip", (unsigned long)lo, (hi-lo)/1048576.0, off/1048576.0, avail/1024.0,
+                 before/1048576.0, after/1048576.0, observed ? "mincore" : "unknown",
+                 attempted ? (rc ? strerror(-rc) : "MADV_PAGEOUT accepted") : "skipped: no resident pages or mapping changed");
+    }
+    return NULL;
+}
+static void fbr_start_once(void) {
+    pthread_t th;
+    if (pthread_create(&th, NULL, fbr_main, NULL))
+        VRED("file-backed deferred PAGEOUT: worker could not start");
+    else { pthread_detach(th);
+        VLOG("file-backed deferred PAGEOUT: monitoring file-backed textures every 5 s; two low-memory samples, 128 MiB per hint, 30 s per-pool cooldown, no PSI; opt out DM_MEM_FILEBACK_RECLAIM=0");
+    }
 }
 // The readable runs of a range (vka_fileback.h's copies): 0 = a run is not mapped or the runs were not read (not moved then)
 static int fb_runs(uintptr_t lo, uintptr_t hi, prun *pr, int *npr, vkfb_run *rr, int *nrr) {
