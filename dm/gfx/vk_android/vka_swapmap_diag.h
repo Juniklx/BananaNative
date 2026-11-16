@@ -8,6 +8,16 @@
 #define VKSM_NAME 96
 #define VKSM_TOP 8
 #define VKSM_MAX_BYTES (32ull << 20)
+#define VKSM_POLL_SEC 1u
+// Early diagnostic threshold, intentionally separate from the more severe
+// file-backed PAGEOUT threshold. Captures SwapPss before the game stalls at
+// <1 fps; never changes memory mapping, eviction, or allocator policy.
+static inline int vksm_diag_due(uint64_t mem_total_kb, uint64_t mem_avail_kb) {
+    if (!mem_total_kb || !mem_avail_kb) return 0;
+    uint64_t reserve = mem_total_kb / 8;
+    if (reserve < 512ull * 1024) reserve = 512ull * 1024;
+    return mem_avail_kb <= reserve * 2;
+}
 typedef struct { uint64_t lo, hi, rss_kb, swap_kb; char name[VKSM_NAME]; } vksm_vma;
 enum { VKSM_GUEST, VKSM_GPU, VKSM_ANON, VKSM_FILE, VKSM_GROUPS };
 static inline int vksm_map_line(const char *line, vksm_vma *v) {

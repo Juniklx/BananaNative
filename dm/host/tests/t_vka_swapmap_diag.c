@@ -19,5 +19,15 @@ int main(void) {
     CHECK(!vksm_field_kb("Swap: 120 kB", "SwapPss:", &kb));
     CHECK(!vksm_map_line("VmFlags: rd wr mr mw me ac\n", &v));
     CHECK(!vksm_map_line("1000-1000 rw-p 00000000 00:00 0\n", &v));
+    const uint64_t total = 7224ull * 1024; // Galaxy S24 FE measured MemTotal
+    CHECK(VKSM_POLL_SEC == 1);
+    CHECK(vksm_diag_due(total, 1783ull * 1024)); // early warning in 21:02 run
+    CHECK(vksm_diag_due(total, 1806ull * 1024)); // two times the 903 MiB reserve
+    CHECK(!vksm_diag_due(total, 1807ull * 1024));
+    CHECK(!vksm_diag_due(total, 2055ull * 1024)); // early game, no snapshot
+    CHECK(!vksm_diag_due(0, 1000ull * 1024));
+    CHECK(!vksm_diag_due(total, 0));
+    CHECK(vksm_diag_due(1024ull * 1024, 1024ull * 1024)); // 512 MiB minimum reserve
+    CHECK(!vksm_diag_due(1024ull * 1024, 1025ull * 1024));
     puts("t_vka_swapmap_diag: ok"); return 0;
 }
