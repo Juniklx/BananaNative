@@ -1538,10 +1538,29 @@ static void fbr_swapdiag_once(void) {
              i + 1, top[i].swap_kb / 1024.0, top[i].rss_kb / 1024.0,
              (unsigned long long)top[i].lo, (top[i].hi - top[i].lo) / 1048576.0, top[i].name);
 }
+// The diagnostic has its own lightweight timer. The existing file-backed
+// reclaim cadence remains five seconds with two critical-RAM samples.
+// Starting diagnosis earlier matters when the final scene loading burst takes
+// RAM from ~1.8 GiB available to <700 MiB before that cadence can fire.
+static void *fbr_swapdiag_main(void *arg) {
+    (void)arg;
+    pthread_setname_np(pthread_self(), "vk-swapmap-diag");
+    for (;;) {
+        if (!VKA_ENV("DM_VK_SWAPMAP_DIAG", 0)) return NULL;
+        uint64_t total = 0, avail = 0;
+        if (fbr_meminfo(&total, &avail) && vksm_diag_due(total, avail)) {
+            VLOG("swapmap diagnostic trigger: MemAvailable %.1f MiB, MemTotal %.1f MiB, early limit %.1f MiB (one snapshot, PAGEOUT policy unchanged)",
+                 avail / 1024.0, total / 1024.0, ((total / 8 > 512ull * 1024) ? total / 8 : 512ull * 1024) * 2 / 1024.0);
+            fbr_swapdiag_once(); // no g_pl, g_fbmu, or Vulkan texture locks
+            return NULL;
+        }
+        sleep(VKSM_POLL_SEC);
+    }
+    return NULL;
+}
 static void *fbr_main(void *arg) {
     (void)arg; pthread_setname_np(pthread_self(), "vk-fb-reclaim");
     unsigned consecutive = 0;
-    int swapdiag_done = 0;
     for (;;) {
         sleep(VKFR_POLL_SEC);
         if (!VKA_ENV("DM_MEM_FILEBACK_RECLAIM", 0)) { consecutive = 0; continue; }
@@ -1552,10 +1571,6 @@ static void *fbr_main(void *arg) {
         if (avail <= reserve) { if (consecutive < 3) consecutive++; }
         else { consecutive = 0; continue; }
         if (!vkfr_pressure(total, avail, consecutive)) continue;
-        if (!swapdiag_done && VKA_ENV("DM_VK_SWAPMAP_DIAG", 0)) {
-            swapdiag_done = 1;
-            fbr_swapdiag_once(); // once, without g_pl or g_fbmu
-        }
         uintptr_t lo = 0, hi = 0; uint64_t off = 0, now = mono_ns();
         pthread_mutex_lock(&g_fbmu);
         for (int i = 0; i < g_nfbr; i++) {
@@ -1600,10 +1615,19 @@ static void *fbr_main(void *arg) {
 }
 static void fbr_start_once(void) {
     pthread_t th;
-    if (pthread_create(&th, NULL, fbr_main, NULL))
-        VRED("file-backed deferred PAGEOUT: worker could not start");
-    else { pthread_detach(th);
-        VLOG("file-backed deferred PAGEOUT: monitoring file-backed textures every 5 s; two low-memory samples, 128 MiB per hint, 30 s per-pool cooldown, no PSI; opt out DM_MEM_FILEBACK_RECLAIM=0");
+    if (VKA_ENV("DM_MEM_FILEBACK_RECLAIM", 0)) {
+        if (pthread_create(&th, NULL, fbr_main, NULL))
+            VRED("file-backed deferred PAGEOUT: worker could not start");
+        else { pthread_detach(th);
+            VLOG("file-backed deferred PAGEOUT: monitoring file-backed textures every 5 s; two low-memory samples, 128 MiB per hint, 30 s per-pool cooldown, no PSI; opt out DM_MEM_FILEBACK_RECLAIM=0");
+        }
+    }
+    if (VKA_ENV("DM_VK_SWAPMAP_DIAG", 0)) {
+        if (pthread_create(&th, NULL, fbr_swapdiag_main, NULL))
+            VRED("swapmap diagnostic: early 1-second monitor could not start");
+        else { pthread_detach(th);
+            VLOG("swapmap diagnostic: early monitor started (MemAvailable <= 2x reserve, checked every 1 s; one bounded snapshot; no PAGEOUT changes)");
+        }
     }
 }
 // The readable runs of a range (vka_fileback.h's copies): 0 = a run is not mapped or the runs were not read (not moved then)
@@ -1656,21 +1680,25 @@ void dm_gfx_pool_fileback(const void *mem, uint64_t size, int kind) {   // hle_n
     char st[400];
     pthread_mutex_lock(&g_fbmu);
     if (!r && !vkfb_tab_add(&g_fb, lo, hi, (uint64_t)off)) r = -ENOMEM;   // (not in the table: it would never go back; a table that cannot grow is a failure, the pool is moved back below)
-    int nlog = 0, candidate_added = 0;
+    int nlog = 0, monitor_needed = 0;
     if (!r) {
         g_fbs.pools++; g_fbs.moved += copied; atomic_store(&g_fb_n, g_fb.n);
         nlog = g_fbs.pools <= 8 || !(g_fbs.pools & 63);
+        // A one-shot diagnostic is independent of whether PAGEOUT is enabled.
+        // Start the monitor after the first successful texture file mapping,
+        // not only after a large pool meets the reclaim admission threshold.
+        if (kind == 2 && VKA_ENV("DM_VK_SWAPMAP_DIAG", 0)) monitor_needed = 1;
         if (kind == 2 && VKA_ENV("DM_MEM_FILEBACK_RECLAIM", 0) && vkfr_candidate(size, copied)) {
             if (g_nfbr < FBRC_MAX) {
                 g_fbr[g_nfbr++] = (fbr_cand){.lo=lo, .hi=hi, .off=(uint64_t)off, .born=mono_ns()};
-                candidate_added = 1;
+                monitor_needed = 1;
             } else VRED_ONCE("file-backed deferred PAGEOUT: candidate table full (%d), later pools unmonitored", FBRC_MAX);
         }
     } else g_fbs.fails++;
     if (r && r != -ENOMEM) vkfb_punch(g_fb_fd, (uint64_t)off, size);
     fb_line(st, sizeof st);
     pthread_mutex_unlock(&g_fbmu);
-    if (candidate_added) pthread_once(&g_fbr_once, fbr_start_once);
+    if (monitor_needed) pthread_once(&g_fbr_once, fbr_start_once);
     if (r == -ENOMEM && known) {   // moved, but not recorded: back to anonymous memory now
         pthread_mutex_lock(&g_pl); swap_begin(lo, hi); prot_readonly(pr, npr); uint64_t c2; int l2;
         int r2 = vkfb_to_anon(g_fb_fd, (uint64_t)off, lo, size, rr, nrr, &c2, &l2); if (!r2 || l2) plat_mem_name_guest((void *)lo, size); prot_apply(pr, npr); swap_end_ok(0); swap_end(); pthread_mutex_unlock(&g_pl);
